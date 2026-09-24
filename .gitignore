@@ -1,5 +1,6 @@
 /target/
 /cli/target/
+/grammars/
 .env
 .env.*
 !.env.example
