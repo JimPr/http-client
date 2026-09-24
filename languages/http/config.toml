@@ -1,0 +1,7 @@
+name = "HTTP Client"
+grammar = "http"
+path_suffixes = ["http", "rest"]
+line_comments = ["# "]
+tab_size = 2
+hard_tabs = false
+
