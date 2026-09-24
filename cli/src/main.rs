@@ -1,8 +1,8 @@
-use std::{collections::BTreeMap, env, fs, process::ExitCode, time::Duration};
+use std::{collections::BTreeMap, env, fs, path::PathBuf, process::ExitCode, time::Duration};
 
 use zed_http_runner::{
-    execute, load_env_file, parse_document, render_response, resolve_request, select_request,
-    Selection,
+    execute, load_env_file, load_environment, merge_variable_sources, parse_document,
+    render_response, resolve_request, select_request, EnvironmentOptions, Selection,
 };
 
 const DEFAULT_TIMEOUT_SECONDS: u64 = 30;
@@ -30,6 +30,11 @@ fn run(arguments: Vec<String>) -> Result<String, String> {
     let mut maximum_response_bytes = DEFAULT_MAX_RESPONSE_BYTES;
     let mut environment_variables = BTreeMap::new();
     let mut explicit_variables = BTreeMap::new();
+    let mut environment = None;
+    let mut use_default_environment = false;
+    let mut project_root = None;
+    let mut config = None;
+    let mut private_config = None;
     let mut index = 1;
     while index < arguments.len() {
         match arguments[index].as_str() {
@@ -80,11 +85,41 @@ fn run(arguments: Vec<String>) -> Result<String, String> {
                     .map_err(|error| error.to_string())?;
                 environment_variables.extend(loaded);
             }
+            "--environment" => {
+                index += 1;
+                environment = Some(argument(&arguments, index, "--environment")?.into());
+            }
+            "--use-default-environment" => use_default_environment = true,
+            "--project-root" => {
+                index += 1;
+                project_root = Some(PathBuf::from(argument(&arguments, index, "--project-root")?));
+            }
+            "--config" => {
+                index += 1;
+                config = Some(PathBuf::from(argument(&arguments, index, "--config")?));
+            }
+            "--private-config" => {
+                index += 1;
+                private_config = Some(PathBuf::from(argument(&arguments, index, "--private-config")?));
+            }
             option => return Err(format!("unknown option `{option}`\n{}", usage())),
         }
         index += 1;
     }
-    environment_variables.extend(explicit_variables);
+    let selected_environment = load_environment(&EnvironmentOptions {
+        request_path: PathBuf::from(path),
+        environment,
+        use_default: use_default_environment,
+        project_root,
+        config,
+        private_config,
+    })
+    .map_err(|error| error.to_string())?;
+    environment_variables = merge_variable_sources(
+        selected_environment,
+        environment_variables,
+        explicit_variables,
+    );
 
     let source = fs::read_to_string(path).map_err(|error| format!("cannot read `{path}`: {error}"))?;
     let requests = parse_document(&source).map_err(|error| error.to_string())?;
@@ -108,5 +143,5 @@ fn argument<'a>(arguments: &'a [String], index: usize, option: &str) -> Result<&
 }
 
 fn usage() -> String {
-    "usage: zed-http <file.http> [--name NAME | --index INDEX | --line LINE] [--env-file .env] [--var NAME=VALUE] [--timeout-seconds N] [--max-response-bytes N]".into()
+    "usage: zed-http <file.http> [--name NAME | --index INDEX | --line LINE] [--environment NAME | --use-default-environment] [--project-root PATH] [--config PATH] [--private-config PATH] [--env-file .env] [--var NAME=VALUE] [--timeout-seconds N] [--max-response-bytes N]".into()
 }

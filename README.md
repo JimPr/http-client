@@ -68,12 +68,69 @@ contains no `Cargo.toml`, so Zed treats it as the language extension declared by
 `extension.toml` and does not attempt to compile a Rust or WASM extension. The CLI
 remains an independent Cargo project under `cli/`.
 
-## Usage
+## Environments and usage
 
 ```sh
 zed-http examples/widgets.http --name list-widgets --env-file .env.private
-zed-http examples/widgets.http --line 8 --timeout-seconds 10
+zed-http examples/widgets.http --line 8 --use-default-environment --project-root "$PWD"
+zed-http examples/widgets.http --name list-widgets --environment staging
 ```
+
+Repository environments are configured in the versioned
+`http-client.environments.json`; copy
+`http-client.environments.example.json` to start one. Keep secrets only in
+`http-client.environments.private.json`, which is strictly Git-ignored. The private
+file overlays the public file for the selected environment:
+
+```json
+{
+  "version": 1,
+  "defaultEnvironment": "local",
+  "environments": {
+    "local": { "API_BASE_URL": "http://127.0.0.1:3000" },
+    "staging": { "API_BASE_URL": "https://staging.example.test" },
+    "production": { "API_BASE_URL": "https://api.example.test" }
+  }
+}
+```
+
+`version` must be `1`. `defaultEnvironment` is required if a configuration names
+more than one environment and must name one of them. Environment values are plain
+string key/value pairs. The selected public values are loaded first, then private
+values overlay them. `--environment NAME` selects exactly one name;
+`--use-default-environment` selects the default. The two selectors cannot be
+combined. With no configuration present, `--use-default-environment` deliberately
+keeps the historical behavior and adds no values.
+
+The repository task uses the default and bounds configuration discovery to
+`"$ZED_WORKTREE_ROOT"`. Use Zed's runnable menu/task picker for an explicit
+environment. For example, add variants like these (all retain the
+`http-client-request` tag and inject no values into a command):
+
+```json
+[
+  {
+    "label": "HTTP: run request at cursor (local)",
+    "command": "zed-http \"$ZED_FILE\" --line \"$((ZED_ROW + 1))\" --environment \"local\" --project-root \"$ZED_WORKTREE_ROOT\"",
+    "tags": ["http-client-request"]
+  },
+  {
+    "label": "HTTP: run request at cursor (staging)",
+    "command": "zed-http \"$ZED_FILE\" --line \"$((ZED_ROW + 1))\" --environment \"staging\" --project-root \"$ZED_WORKTREE_ROOT\"",
+    "tags": ["http-client-request"]
+  },
+  {
+    "label": "HTTP: run request at cursor (production)",
+    "command": "zed-http \"$ZED_FILE\" --line \"$((ZED_ROW + 1))\" --environment \"production\" --project-root \"$ZED_WORKTREE_ROOT\"",
+    "tags": ["http-client-request"]
+  }
+]
+```
+
+`--config PATH` and `--private-config PATH` select explicit configuration files.
+Otherwise the CLI searches upward from the request file and never goes above
+`--project-root`. Values resolve with this precedence: `--var` > `--env-file` >
+private configuration > public configuration > process environment.
 
 See the [format and security rules](docs/HTTP-FORMAT-AND-SECURITY.md) and the
 [Zed surface actually provided](docs/ZED-SURFACE.md). Requests are never run

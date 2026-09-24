@@ -17,6 +17,7 @@ use reqwest::{
     redirect::Policy,
     Method,
 };
+use serde::Deserialize;
 use thiserror::Error;
 
 const MAX_REDIRECTS: usize = 10;
@@ -55,6 +56,202 @@ pub enum HttpFileError {
     EnvironmentFileRead(std::io::Error),
     #[error("environment file line {line}: expected NAME=VALUE")]
     InvalidEnvironmentLine { line: usize },
+    #[error("environment configuration could not be read")]
+    EnvironmentConfigurationRead,
+    #[error("environment configuration is invalid")]
+    InvalidEnvironmentConfiguration,
+    #[error("unsupported environment configuration version")]
+    UnsupportedEnvironmentConfigurationVersion,
+    #[error("environment configuration with multiple environments requires defaultEnvironment")]
+    DefaultEnvironmentRequired,
+    #[error("environment configuration defaultEnvironment does not name an environment")]
+    InvalidDefaultEnvironment,
+    #[error("unknown environment `{0}`")]
+    UnknownEnvironment(String),
+    #[error("no environment configuration was found")]
+    EnvironmentConfigurationNotFound,
+    #[error("--environment and --use-default-environment cannot be used together")]
+    IncompatibleEnvironmentSelectors,
+}
+
+const ENVIRONMENT_CONFIG_NAME: &str = "http-client.environments.json";
+const PRIVATE_ENVIRONMENT_CONFIG_NAME: &str = "http-client.environments.private.json";
+
+#[derive(Debug, Clone)]
+pub struct EnvironmentOptions {
+    pub request_path: std::path::PathBuf,
+    pub environment: Option<String>,
+    pub use_default: bool,
+    pub project_root: Option<std::path::PathBuf>,
+    pub config: Option<std::path::PathBuf>,
+    pub private_config: Option<std::path::PathBuf>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct EnvironmentConfiguration {
+    version: u32,
+    #[serde(default)]
+    default_environment: Option<String>,
+    environments: BTreeMap<String, BTreeMap<String, String>>,
+}
+
+/// Returns the selected environment's values without mutating the process environment.
+/// When no selector is requested, and when `--use-default-environment` finds no
+/// configuration, this intentionally returns no values to preserve historical behavior.
+pub fn load_environment(
+    options: &EnvironmentOptions,
+) -> Result<BTreeMap<String, String>, HttpFileError> {
+    if options.environment.is_some() && options.use_default {
+        return Err(HttpFileError::IncompatibleEnvironmentSelectors);
+    }
+    if options.environment.is_none() && !options.use_default {
+        return Ok(BTreeMap::new());
+    }
+
+    let (public_path, private_path) = configuration_paths(options);
+    let public = read_environment_configuration(public_path.as_deref())?;
+    let private = read_environment_configuration(private_path.as_deref())?;
+    if public.is_none() && private.is_none() {
+        return if options.use_default {
+            Ok(BTreeMap::new())
+        } else {
+            Err(HttpFileError::EnvironmentConfigurationNotFound)
+        };
+    }
+
+    let selected = match &options.environment {
+        Some(name) => name.clone(),
+        None => default_environment(public.as_ref(), private.as_ref())?,
+    };
+    let mut variables = BTreeMap::new();
+    let mut found = false;
+    for configuration in [public.as_ref(), private.as_ref()].into_iter().flatten() {
+        if let Some(values) = configuration.environments.get(&selected) {
+            variables.extend(values.clone());
+            found = true;
+        }
+    }
+    if found {
+        Ok(variables)
+    } else {
+        Err(HttpFileError::UnknownEnvironment(selected))
+    }
+}
+
+/// Combines explicit sources in increasing precedence. Process variables are resolved
+/// later by `resolve_request`, maintaining compatibility for variables absent here.
+pub fn merge_variable_sources(
+    environment: BTreeMap<String, String>,
+    env_file: BTreeMap<String, String>,
+    explicit: BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    environment
+        .into_iter()
+        .chain(env_file)
+        .chain(explicit)
+        .collect()
+}
+
+fn configuration_paths(
+    options: &EnvironmentOptions,
+) -> (Option<std::path::PathBuf>, Option<std::path::PathBuf>) {
+    if options.config.is_some() || options.private_config.is_some() {
+        return (options.config.clone(), options.private_config.clone());
+    }
+    discover_configuration_paths(&options.request_path, options.project_root.as_deref())
+}
+
+fn discover_configuration_paths(
+    request_path: &Path,
+    project_root: Option<&Path>,
+) -> (Option<std::path::PathBuf>, Option<std::path::PathBuf>) {
+    let Some(mut directory) = request_path.parent().and_then(|path| path.canonicalize().ok())
+    else {
+        return (None, None);
+    };
+    let project_root = match project_root {
+        Some(path) => match path.canonicalize() {
+            Ok(path) => Some(path),
+            Err(_) => return (None, None),
+        },
+        None => None,
+    };
+    if project_root
+        .as_ref()
+        .is_some_and(|root| !directory.starts_with(root))
+    {
+        return (None, None);
+    }
+
+    loop {
+        let public = directory.join(ENVIRONMENT_CONFIG_NAME);
+        let private = directory.join(PRIVATE_ENVIRONMENT_CONFIG_NAME);
+        if public.is_file() || private.is_file() {
+            return (
+                public.is_file().then_some(public),
+                private.is_file().then_some(private),
+            );
+        }
+        if project_root.as_ref().is_some_and(|root| directory == *root) {
+            break;
+        }
+        let Some(parent) = directory.parent() else {
+            break;
+        };
+        directory = parent.to_path_buf();
+    }
+    (None, None)
+}
+
+fn read_environment_configuration(
+    path: Option<&Path>,
+) -> Result<Option<EnvironmentConfiguration>, HttpFileError> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let source = fs::read_to_string(path).map_err(|_| HttpFileError::EnvironmentConfigurationRead)?;
+    let configuration: EnvironmentConfiguration =
+        serde_json::from_str(&source).map_err(|_| HttpFileError::InvalidEnvironmentConfiguration)?;
+    if configuration.version != 1 {
+        return Err(HttpFileError::UnsupportedEnvironmentConfigurationVersion);
+    }
+    validate_environment_configuration(&configuration)?;
+    Ok(Some(configuration))
+}
+
+fn validate_environment_configuration(
+    configuration: &EnvironmentConfiguration,
+) -> Result<(), HttpFileError> {
+    if configuration.environments.len() > 1 && configuration.default_environment.is_none() {
+        return Err(HttpFileError::DefaultEnvironmentRequired);
+    }
+    if let Some(default) = &configuration.default_environment
+        && !configuration.environments.contains_key(default)
+    {
+        return Err(HttpFileError::InvalidDefaultEnvironment);
+    }
+    Ok(())
+}
+
+fn default_environment(
+    public: Option<&EnvironmentConfiguration>,
+    private: Option<&EnvironmentConfiguration>,
+) -> Result<String, HttpFileError> {
+    if let Some(default) = public
+        .and_then(|configuration| configuration.default_environment.clone())
+        .or_else(|| private.and_then(|configuration| configuration.default_environment.clone()))
+    {
+        return Ok(default);
+    }
+    let names = [public, private]
+        .into_iter()
+        .flatten()
+        .flat_map(|configuration| configuration.environments.keys().cloned())
+        .collect::<std::collections::BTreeSet<_>>();
+    (names.len() == 1)
+        .then(|| names.into_iter().next().expect("one name exists"))
+        .ok_or(HttpFileError::DefaultEnvironmentRequired)
 }
 
 /// Loads a simple dotenv file. File values are intentionally returned rather than

@@ -16,7 +16,8 @@ project-specific example.
 
 The global and local task use the exact `http-client-request` tag emitted by the
 runnable query; the tag match associates the task with request runnables. Both pass
-`"$ZED_FILE"` and `"$((ZED_ROW + 1))"` to `zed-http`. Zed supplies `ZED_ROW` as a
+`"$ZED_FILE"` and `"$((ZED_ROW + 1))"` to `zed-http`, then pass
+`--use-default-environment --project-root "$ZED_WORKTREE_ROOT"`. Zed supplies `ZED_ROW` as a
 zero-based row, while the CLI expects a one-based line, so the task increments it.
 `zed-http` must be installed on `PATH`.
 
@@ -25,6 +26,12 @@ markers only. It **does not** provide automatic execution, a response panel, or 
 WASM command that accesses the network. The gutter arrow invokes the matching
 project task; execution remains explicit and the separately installed CLI runs in a
 terminal. A request never starts when a file is opened, parsed, or highlighted.
+
+Zed declarative extensions do not support a CTA or a select box for choosing an
+environment. This is intentional: choose `local`, `staging`, or `production` by
+adding tagged `--environment NAME` task variants and selecting one from the runnable
+menu/task picker. The generic task uses the configured default instead. No task
+contains environment values or secrets.
 
 ## Extension / CLI separation
 
