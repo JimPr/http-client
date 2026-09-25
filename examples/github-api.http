@@ -1,0 +1,21 @@
+# Run:
+# zed-http examples/github-api.http --name get-environment-example
+# zed-http examples/github-api.http --name render-markdown
+
+# @name get-environment-example
+@raw_github = https://raw.githubusercontent.com
+@path = /JimPr/http-client/main/http-client.environments.example.json
+GET {{raw_github}}{{path}}
+Accept: application/json
+
+###
+# @name render-markdown
+POST {{github_api}}/markdown
+Accept: text/html
+Content-Type: application/json
+User-Agent: zed-http-example
+
+{
+  "text": "# HTTP Client\n\nA **public POST** request.",
+  "mode": "markdown"
+}

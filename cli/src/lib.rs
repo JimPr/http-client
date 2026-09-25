@@ -6,7 +6,7 @@
 use std::{
     collections::BTreeMap,
     fs,
-    io::Read,
+    io::{BufRead, Read, Write},
     path::Path,
     time::{Duration, Instant},
 };
@@ -30,6 +30,8 @@ pub enum HttpFileError {
     InvalidRequestLine { line: usize },
     #[error("line {line}: invalid header; expected `Name: value`")]
     InvalidHeader { line: usize },
+    #[error("line {line}: invalid inline variable declaration")]
+    InvalidInlineVariableDeclaration { line: usize },
     #[error("no HTTP request was found")]
     NoRequests,
     #[error("no request named `{0}`")]
@@ -52,103 +54,200 @@ pub enum HttpFileError {
     RequestFailed,
     #[error("response body could not be read: {0}")]
     ResponseRead(#[from] std::io::Error),
-    #[error("environment file could not be read: {0}")]
-    EnvironmentFileRead(std::io::Error),
-    #[error("environment file line {line}: expected NAME=VALUE")]
-    InvalidEnvironmentLine { line: usize },
     #[error("environment configuration could not be read")]
     EnvironmentConfigurationRead,
     #[error("environment configuration is invalid")]
     InvalidEnvironmentConfiguration,
+    #[error("environment configuration version 1 is no longer supported; migrate to version 2")]
+    LegacyEnvironmentConfigurationVersion,
     #[error("unsupported environment configuration version")]
     UnsupportedEnvironmentConfigurationVersion,
-    #[error("environment configuration with multiple environments requires defaultEnvironment")]
-    DefaultEnvironmentRequired,
-    #[error("environment configuration defaultEnvironment does not name an environment")]
-    InvalidDefaultEnvironment,
     #[error("unknown environment `{0}`")]
     UnknownEnvironment(String),
     #[error("no environment configuration was found")]
     EnvironmentConfigurationNotFound,
-    #[error("--environment and --use-default-environment cannot be used together")]
-    IncompatibleEnvironmentSelectors,
+    #[error("--select-environment cannot be used with --environment")]
+    IncompatibleInteractiveEnvironmentSelector,
+    #[error("environment selection was cancelled; no request was sent")]
+    EnvironmentSelectionCancelled,
+    #[error("invalid environment selection; enter a number from the displayed list")]
+    InvalidEnvironmentSelection,
 }
 
 const ENVIRONMENT_CONFIG_NAME: &str = "http-client.environments.json";
 const PRIVATE_ENVIRONMENT_CONFIG_NAME: &str = "http-client.environments.private.json";
-
 #[derive(Debug, Clone)]
 pub struct EnvironmentOptions {
     pub request_path: std::path::PathBuf,
     pub environment: Option<String>,
-    pub use_default: bool,
     pub project_root: Option<std::path::PathBuf>,
     pub config: Option<std::path::PathBuf>,
     pub private_config: Option<std::path::PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectedEnvironment {
+    pub name: Option<String>,
+    pub values: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct EnvironmentConfiguration {
     version: u32,
-    #[serde(default)]
-    default_environment: Option<String>,
-    environments: BTreeMap<String, BTreeMap<String, String>>,
+    environments: Vec<NamedEnvironment>,
 }
 
-/// Returns the selected environment's values without mutating the process environment.
-/// When no selector is requested, and when `--use-default-environment` finds no
-/// configuration, this intentionally returns no values to preserve historical behavior.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NamedEnvironment {
+    name: String,
+    variables: BTreeMap<String, String>,
+}
+
+/// Returns the explicitly selected environment's values without mutating the process
+/// environment. Without an explicit selector it intentionally returns no values.
 pub fn load_environment(
     options: &EnvironmentOptions,
 ) -> Result<BTreeMap<String, String>, HttpFileError> {
-    if options.environment.is_some() && options.use_default {
-        return Err(HttpFileError::IncompatibleEnvironmentSelectors);
-    }
-    if options.environment.is_none() && !options.use_default {
-        return Ok(BTreeMap::new());
-    }
+    Ok(load_selected_environment(options)?.values)
+}
 
-    let (public_path, private_path) = configuration_paths(options);
-    let public = read_environment_configuration(public_path.as_deref())?;
-    let private = read_environment_configuration(private_path.as_deref())?;
+/// Loads the explicitly selected environment. A missing configuration deliberately
+/// preserves historical behavior when no explicit environment was requested.
+pub fn load_selected_environment(
+    options: &EnvironmentOptions,
+) -> Result<SelectedEnvironment, HttpFileError> {
+    let (public, private) = read_environment_configurations(options)?;
     if public.is_none() && private.is_none() {
-        return if options.use_default {
-            Ok(BTreeMap::new())
-        } else {
-            Err(HttpFileError::EnvironmentConfigurationNotFound)
-        };
+        if options.environment.is_some() {
+            return Err(HttpFileError::EnvironmentConfigurationNotFound);
+        }
+        return Ok(SelectedEnvironment {
+            name: None,
+            values: BTreeMap::new(),
+        });
     }
 
-    let selected = match &options.environment {
-        Some(name) => name.clone(),
-        None => default_environment(public.as_ref(), private.as_ref())?,
-    };
-    let mut variables = BTreeMap::new();
-    let mut found = false;
-    for configuration in [public.as_ref(), private.as_ref()].into_iter().flatten() {
-        if let Some(values) = configuration.environments.get(&selected) {
-            variables.extend(values.clone());
-            found = true;
-        }
-    }
-    if found {
-        Ok(variables)
-    } else {
-        Err(HttpFileError::UnknownEnvironment(selected))
+    let source = environment_source(public.as_ref(), private.as_ref());
+    let selected = options.environment.clone();
+    match selected {
+        Some(selected) => selected_environment(&selected, source, public.as_ref(), private.as_ref()),
+        None => Ok(SelectedEnvironment {
+            name: None,
+            values: BTreeMap::new(),
+        }),
     }
 }
 
-/// Combines explicit sources in increasing precedence. Process variables are resolved
-/// later by `resolve_request`, maintaining compatibility for variables absent here.
+/// Renders an ordered terminal list and reads one selection. It only reads stdin
+/// when a configuration exists, so old projects continue to run without interaction.
+pub fn select_environment<R: BufRead, W: Write>(
+    options: &EnvironmentOptions,
+    reader: &mut R,
+    writer: &mut W,
+) -> Result<SelectedEnvironment, HttpFileError> {
+    if options.environment.is_some() {
+        return Err(HttpFileError::IncompatibleInteractiveEnvironmentSelector);
+    }
+    let (public, private) = read_environment_configurations(options)?;
+    let Some(source) = environment_source(public.as_ref(), private.as_ref()) else {
+        return Ok(SelectedEnvironment {
+            name: None,
+            values: BTreeMap::new(),
+        });
+    };
+    writeln!(writer, "Select environment:").map_err(|_| HttpFileError::EnvironmentSelectionCancelled)?;
+    for (index, environment) in source.environments.iter().enumerate() {
+        let preselected = (index == 0).then_some(" (preselected)").unwrap_or_default();
+        writeln!(writer, "  {}. {}{preselected}", index + 1, environment.name)
+            .map_err(|_| HttpFileError::EnvironmentSelectionCancelled)?;
+    }
+    write!(writer, "Enter a number [1]: ").map_err(|_| HttpFileError::EnvironmentSelectionCancelled)?;
+    writer.flush().map_err(|_| HttpFileError::EnvironmentSelectionCancelled)?;
+    let mut input = String::new();
+    if reader
+        .read_line(&mut input)
+        .map_err(|_| HttpFileError::EnvironmentSelectionCancelled)?
+        == 0
+    {
+        return Err(HttpFileError::EnvironmentSelectionCancelled);
+    }
+    let selected_index = if input.trim().is_empty() {
+        0
+    } else {
+        input
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .and_then(|number| number.checked_sub(1))
+            .filter(|index| *index < source.environments.len())
+            .ok_or(HttpFileError::InvalidEnvironmentSelection)?
+    };
+    let selected = &source.environments[selected_index].name;
+    selected_environment(selected, Some(source), public.as_ref(), private.as_ref())
+}
+
+fn read_environment_configurations(
+    options: &EnvironmentOptions,
+) -> Result<(Option<EnvironmentConfiguration>, Option<EnvironmentConfiguration>), HttpFileError> {
+    let (public_path, private_path) = configuration_paths(options);
+    Ok((
+        read_environment_configuration(public_path.as_deref())?,
+        read_environment_configuration(private_path.as_deref())?,
+    ))
+}
+
+fn environment_source<'a>(
+    public: Option<&'a EnvironmentConfiguration>,
+    private: Option<&'a EnvironmentConfiguration>,
+) -> Option<&'a EnvironmentConfiguration> {
+    public.or(private)
+}
+
+fn selected_environment(
+    selected: &str,
+    source: Option<&EnvironmentConfiguration>,
+    public: Option<&EnvironmentConfiguration>,
+    private: Option<&EnvironmentConfiguration>,
+) -> Result<SelectedEnvironment, HttpFileError> {
+    if !source.is_some_and(|configuration| {
+        configuration
+            .environments
+            .iter()
+            .any(|environment| environment.name == selected)
+    }) {
+        return Err(HttpFileError::UnknownEnvironment(selected.to_owned()));
+    }
+    let mut values = BTreeMap::new();
+    for configuration in [public, private].into_iter().flatten() {
+        if let Some(environment) = configuration
+            .environments
+            .iter()
+            .find(|environment| environment.name == selected)
+        {
+            values.extend(environment.variables.clone());
+        }
+    }
+    Ok(SelectedEnvironment {
+        name: Some(selected.to_owned()),
+        values,
+    })
+}
+
+/// Combines configuration sources in increasing precedence. Process variables are
+/// resolved later by `resolve_request`, maintaining compatibility for variables absent
+/// from the public and private JSON files, inline declarations, and CLI overrides.
 pub fn merge_variable_sources(
-    environment: BTreeMap<String, String>,
-    env_file: BTreeMap<String, String>,
+    public_environment: BTreeMap<String, String>,
+    private_environment: BTreeMap<String, String>,
+    inline: BTreeMap<String, String>,
     explicit: BTreeMap<String, String>,
 ) -> BTreeMap<String, String> {
-    environment
+    public_environment
         .into_iter()
-        .chain(env_file)
+        .chain(private_environment)
+        .chain(inline)
         .chain(explicit)
         .collect()
 }
@@ -211,11 +310,17 @@ fn read_environment_configuration(
         return Ok(None);
     };
     let source = fs::read_to_string(path).map_err(|_| HttpFileError::EnvironmentConfigurationRead)?;
+    let document: serde_json::Value =
+        serde_json::from_str(&source).map_err(|_| HttpFileError::InvalidEnvironmentConfiguration)?;
+    match document.get("version").and_then(serde_json::Value::as_u64) {
+        Some(1) => return Err(HttpFileError::LegacyEnvironmentConfigurationVersion),
+        Some(2) => {}
+        Some(_) => return Err(HttpFileError::UnsupportedEnvironmentConfigurationVersion),
+        None => return Err(HttpFileError::InvalidEnvironmentConfiguration),
+    }
     let configuration: EnvironmentConfiguration =
         serde_json::from_str(&source).map_err(|_| HttpFileError::InvalidEnvironmentConfiguration)?;
-    if configuration.version != 1 {
-        return Err(HttpFileError::UnsupportedEnvironmentConfigurationVersion);
-    }
+    debug_assert_eq!(configuration.version, 2);
     validate_environment_configuration(&configuration)?;
     Ok(Some(configuration))
 }
@@ -223,64 +328,23 @@ fn read_environment_configuration(
 fn validate_environment_configuration(
     configuration: &EnvironmentConfiguration,
 ) -> Result<(), HttpFileError> {
-    if configuration.environments.len() > 1 && configuration.default_environment.is_none() {
-        return Err(HttpFileError::DefaultEnvironmentRequired);
-    }
-    if let Some(default) = &configuration.default_environment
-        && !configuration.environments.contains_key(default)
+    if configuration.environments.is_empty()
+        || configuration
+            .environments
+            .iter()
+            .any(|environment| environment.name.trim().is_empty())
     {
-        return Err(HttpFileError::InvalidDefaultEnvironment);
+        return Err(HttpFileError::InvalidEnvironmentConfiguration);
     }
-    Ok(())
-}
-
-fn default_environment(
-    public: Option<&EnvironmentConfiguration>,
-    private: Option<&EnvironmentConfiguration>,
-) -> Result<String, HttpFileError> {
-    if let Some(default) = public
-        .and_then(|configuration| configuration.default_environment.clone())
-        .or_else(|| private.and_then(|configuration| configuration.default_environment.clone()))
-    {
-        return Ok(default);
-    }
-    let names = [public, private]
-        .into_iter()
-        .flatten()
-        .flat_map(|configuration| configuration.environments.keys().cloned())
+    let unique_names = configuration
+        .environments
+        .iter()
+        .map(|environment| environment.name.as_str())
         .collect::<std::collections::BTreeSet<_>>();
-    (names.len() == 1)
-        .then(|| names.into_iter().next().expect("one name exists"))
-        .ok_or(HttpFileError::DefaultEnvironmentRequired)
-}
-
-/// Loads a simple dotenv file. File values are intentionally returned rather than
-/// written to the process environment, so explicit CLI variables can take priority.
-pub fn load_env_file(path: &Path) -> Result<BTreeMap<String, String>, HttpFileError> {
-    let source = fs::read_to_string(path).map_err(HttpFileError::EnvironmentFileRead)?;
-    let mut variables = BTreeMap::new();
-    for (offset, raw_line) in source.lines().enumerate() {
-        let line = raw_line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let line = line.strip_prefix("export ").unwrap_or(line);
-        let Some((name, raw_value)) = line.split_once('=') else {
-            return Err(HttpFileError::InvalidEnvironmentLine { line: offset + 1 });
-        };
-        let name = name.trim();
-        if name.is_empty() {
-            return Err(HttpFileError::InvalidEnvironmentLine { line: offset + 1 });
-        }
-        let value = raw_value.trim();
-        let value = value
-            .strip_prefix('"')
-            .and_then(|value| value.strip_suffix('"'))
-            .or_else(|| value.strip_prefix('\'').and_then(|value| value.strip_suffix('\'')))
-            .unwrap_or(value);
-        variables.insert(name.to_owned(), value.to_owned());
-    }
-    Ok(variables)
+    (unique_names.len() == configuration.environments.len())
+        .then_some(())
+        .ok_or(HttpFileError::InvalidEnvironmentConfiguration)?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -327,6 +391,8 @@ impl HttpMethod {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpRequest {
     pub name: Option<String>,
+    /// Inline declarations visible when this request begins. Values are literal.
+    pub inline_variables: BTreeMap<String, String>,
     pub method: HttpMethod,
     pub url: String,
     pub headers: Vec<(String, String)>,
@@ -348,11 +414,14 @@ pub fn parse_document(source: &str) -> Result<Vec<HttpRequest>, HttpFileError> {
     let mut requests = Vec::new();
     let mut pending_name = None;
     let mut block = Vec::new();
+    let mut inline_variables = BTreeMap::new();
 
     for (offset, line) in source.lines().enumerate() {
         let line_number = offset + 1;
         if line.trim_start().starts_with("###") {
-            if let Some(request) = parse_block(&block, pending_name.take())? {
+            if let Some(request) =
+                parse_block(&block, pending_name.take(), &mut inline_variables)?
+            {
                 requests.push(request);
             }
             block.clear();
@@ -363,7 +432,7 @@ pub fn parse_document(source: &str) -> Result<Vec<HttpRequest>, HttpFileError> {
             block.push((line_number, line));
         }
     }
-    if let Some(request) = parse_block(&block, pending_name)? {
+    if let Some(request) = parse_block(&block, pending_name, &mut inline_variables)? {
         requests.push(request);
     }
     if requests.is_empty() {
@@ -375,14 +444,29 @@ pub fn parse_document(source: &str) -> Result<Vec<HttpRequest>, HttpFileError> {
 fn parse_block(
     lines: &[(usize, &str)],
     name: Option<String>,
+    inline_variables: &mut BTreeMap<String, String>,
 ) -> Result<Option<HttpRequest>, HttpFileError> {
-    let Some(start_index) = lines.iter().position(|(_, line)| {
+    let mut start_index = 0;
+    while start_index < lines.len() {
+        let (line_number, line) = lines[start_index];
         let trimmed = line.trim();
-        !trimmed.is_empty() && !trimmed.starts_with('#')
-    }) else {
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            start_index += 1;
+            continue;
+        }
+        if trimmed.starts_with('@') {
+            let (variable_name, value) = parse_inline_declaration(trimmed, line_number)?;
+            inline_variables.insert(variable_name, value);
+            start_index += 1;
+            continue;
+        }
+        break;
+    }
+    if start_index == lines.len() {
         return Ok(None);
-    };
+    }
     let (start_line, request_line) = lines[start_index];
+    let request_inline_variables = inline_variables.clone();
     let mut parts = request_line.split_whitespace();
     let method = parts
         .next()
@@ -421,6 +505,7 @@ fn parse_block(
 
     Ok(Some(HttpRequest {
         name,
+        inline_variables: request_inline_variables,
         method,
         url: url.to_owned(),
         headers,
@@ -428,6 +513,24 @@ fn parse_block(
         start_line,
         end_line,
     }))
+}
+
+fn parse_inline_declaration(
+    line: &str,
+    line_number: usize,
+) -> Result<(String, String), HttpFileError> {
+    let Some((name, value)) = line.strip_prefix('@').and_then(|line| line.split_once('=')) else {
+        return Err(HttpFileError::InvalidInlineVariableDeclaration { line: line_number });
+    };
+    let name = name.trim();
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|character| character.is_alphanumeric() || matches!(character, '_' | '.' | '$' | '-'))
+    {
+        return Err(HttpFileError::InvalidInlineVariableDeclaration { line: line_number });
+    }
+    Ok((name.to_owned(), value.trim().to_owned()))
 }
 
 pub fn select_request<'a>(
@@ -455,6 +558,7 @@ pub fn resolve_request(
 ) -> Result<HttpRequest, HttpFileError> {
     Ok(HttpRequest {
         name: request.name.clone(),
+        inline_variables: request.inline_variables.clone(),
         method: request.method,
         url: resolve_text(&request.url, variables)?,
         headers: request

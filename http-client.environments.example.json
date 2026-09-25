@@ -1,15 +1,17 @@
 {
-  "version": 1,
-  "defaultEnvironment": "local",
-  "environments": {
-    "local": {
-      "API_BASE_URL": "http://127.0.0.1:3000"
+  "version": 2,
+  "environments": [
+    {
+      "name": "local",
+      "variables": {
+        "github_api": "http://127.0.0.1:3000"
+      }
     },
-    "staging": {
-      "API_BASE_URL": "https://staging.example.test"
-    },
-    "production": {
-      "API_BASE_URL": "https://api.example.test"
+    {
+      "name": "prod",
+      "variables": {
+        "github_api": "https://api.github.com"
+      }
     }
-  }
+  ]
 }

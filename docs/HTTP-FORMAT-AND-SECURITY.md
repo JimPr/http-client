@@ -16,7 +16,7 @@ Authorization: Bearer {{API_TOKEN}}
 Select a request explicitly:
 
 ```sh
-zed-http requests.http --name status --env-file .env.private
+zed-http requests.http --name status --select-environment
 zed-http requests.http --index 0
 zed-http requests.http --line 12
 ```
@@ -24,11 +24,30 @@ zed-http requests.http --line 12
 `--index` is zero-based; `--line` is a human-facing, one-based line number. Without
 a selector, only the first request is executed.
 
-`{{NAME}}` variables are resolved in this order: `--var NAME=VALUE`, the file
-passed through `--env-file`, the selected private environment file, the selected
-public environment file, then the process environment. A missing variable is an
-explicit error. Dotenv files accept `NAME=VALUE`, `export NAME=VALUE`, and simply
-quoted values.
+`{{NAME}}` variables are resolved in this order: `--var NAME=VALUE`, visible inline
+declarations, the selected private JSON environment, the selected public JSON
+environment, then the process environment. A missing variable is an explicit error.
+
+## Inline variables
+
+An inline declaration has this form before a request:
+
+```http
+@request_path = /status
+@display_value = "literal quotes remain"
+GET {{API_BASE_URL}}{{request_path}}
+```
+
+The declaration's name is an identifier. Its value is literal: surrounding quotes
+remain in the value, and `{{NAME}}` inside a declaration is not resolved again.
+The declaration applies to requests that follow it, including requests after `###`.
+Redeclaring a name changes the value for later requests only. A section containing
+only declarations changes the values visible to subsequent sections. Lines that
+start with `@` in a request body remain body content.
+
+For a selected request, precedence is `--var NAME=VALUE`, then its visible inline
+declarations, selected private JSON environment values, selected public JSON
+environment values, and the process environment.
 
 ## Repository environments
 
@@ -37,26 +56,33 @@ Use `http-client.environments.json` for non-secret, versioned values and
 
 ```json
 {
-  "version": 1,
-  "defaultEnvironment": "local",
-  "environments": {
-    "local": { "API_BASE_URL": "http://127.0.0.1:3000" }
-  }
+  "version": 2,
+  "environments": [
+    {
+      "name": "local",
+      "variables": { "API_BASE_URL": "http://127.0.0.1:3000" }
+    }
+  ]
 }
 ```
 
-Only version `1` is accepted. Each environment is a string key/value map.
-`defaultEnvironment` is mandatory for more than one environment and must name an
-environment. Select one with `--environment NAME`, or select the default with
-`--use-default-environment`; the selectors are mutually exclusive. An explicit
-name, an absent/invalid default, malformed JSON, an invalid model, or an unsupported
-version fails before an HTTP request is attempted. With no configuration,
-`--use-default-environment` supplies no values and retains the old CLI behavior.
+Only version `2` is accepted. Names must be non-empty and unique, variables must be
+string-to-string maps, and unknown fields are rejected; persistent defaults are not
+supported. With a catalogue, `--select-environment` always prints the numbered list
+and Enter chooses its first item for the current request. With no configuration it
+remains non-interactive.
+`--environment NAME` remains available for technical CLI invocation. The private
+environment file overlays values only.
 
-Without explicit `--config PATH` and `--private-config PATH`, discovery starts beside
-the request and walks upward, stopping at `--project-root PATH`. The generic Zed
-task passes the worktree root specifically to prevent a parent checkout's
-configuration from being used.
+Configuration is loaded at each CLI launch. The success output includes only
+`Environment: NAME`, never variable values; it omits that line when no configuration
+is selected.
+
+`--config PATH` and `--private-config PATH` select explicit public and private JSON
+environment configuration files. Without them, discovery starts beside the request
+and walks upward, stopping at `--project-root PATH`. The generic Zed task passes
+the worktree root specifically to prevent a parent checkout's configuration from
+being used.
 
 ## Security
 
@@ -70,9 +96,10 @@ configuration from being used.
 - Output contains the final URL, status, duration, size, headers, and body. JSON is
   formatted; binary bodies are deliberately omitted.
 - Variable values, including tokens, are never written to CLI diagnostics.
+- Inline declaration values are stored in the request file. Keep secrets in an
+  ignored private JSON environment file instead of inline declarations.
 - The private environment file is Git-ignored. Do not put credentials in the public
   file or in task commands; the included environment example is deliberately
   secret-free.
-
-Never commit secrets. `.env` and `.env.*` are ignored, while `.env.example` is kept
-as a secret-free template.
+Never commit secrets. The private JSON environment file is the only ignored external
+configuration file supported by the CLI.

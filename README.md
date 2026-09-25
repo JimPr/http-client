@@ -13,6 +13,9 @@ runnable gutter arrow beside supported HTTP request methods. It does not include
 Rust or WASM code, a request runner, automatic execution, or a response panel.
 Install the CLI separately when you want to run requests.
 
+Follow the [user guide](docs/USER-GUIDE.md) to install the CLI, configure Zed, run
+the public examples, and select a repository environment.
+
 ## Install the CLI
 
 The CLI is required **only to execute requests**; language association,
@@ -70,11 +73,16 @@ remains an independent Cargo project under `cli/`.
 
 ## Environments and usage
 
+The public examples in [`examples/github-api.http`](examples/github-api.http) require
+no environment configuration:
+
 ```sh
-zed-http examples/widgets.http --name list-widgets --env-file .env.private
-zed-http examples/widgets.http --line 8 --use-default-environment --project-root "$PWD"
-zed-http examples/widgets.http --name list-widgets --environment staging
+zed-http examples/github-api.http --name get-environment-example
+zed-http examples/github-api.http --name render-markdown
 ```
+
+The first request downloads this repository's example configuration from GitHub. The
+second sends Markdown to GitHub's public rendering endpoint.
 
 Repository environments are configured in the versioned
 `http-client.environments.json`; copy
@@ -84,53 +92,47 @@ file overlays the public file for the selected environment:
 
 ```json
 {
-  "version": 1,
-  "defaultEnvironment": "local",
-  "environments": {
-    "local": { "API_BASE_URL": "http://127.0.0.1:3000" },
-    "staging": { "API_BASE_URL": "https://staging.example.test" },
-    "production": { "API_BASE_URL": "https://api.example.test" }
-  }
+  "version": 2,
+  "environments": [
+    { "name": "local", "variables": { "API_BASE_URL": "http://127.0.0.1:3000" } },
+    { "name": "staging", "variables": { "API_BASE_URL": "https://staging.example.test" } },
+    { "name": "production", "variables": { "API_BASE_URL": "https://api.example.test" } }
+  ]
 }
 ```
 
-`version` must be `1`. `defaultEnvironment` is required if a configuration names
-more than one environment and must name one of them. Environment values are plain
-string key/value pairs. The selected public values are loaded first, then private
-values overlay them. `--environment NAME` selects exactly one name;
-`--use-default-environment` selects the default. The two selectors cannot be
-combined. With no configuration present, `--use-default-environment` deliberately
-keeps the historical behavior and adds no values.
+Only version `2` is accepted. Unknown fields, duplicate or empty names, and
+non-string variable values are rejected. Whenever a
+catalogue exists, `--select-environment` always displays its ordered terminal picker.
+Pressing Enter chooses the first item only for that request; no choice is persisted.
+With no configuration, it does not read stdin or render a picker, preserving
+historical behavior and supplying no values. `--environment NAME` remains available
+for direct technical CLI use.
 
-The repository task uses the default and bounds configuration discovery to
-`"$ZED_WORKTREE_ROOT"`. Use Zed's runnable menu/task picker for an explicit
-environment. For example, add variants like these (all retain the
-`http-client-request` tag and inject no values into a command):
+The single repository task passes `--select-environment` and bounds discovery to
+`"$ZED_WORKTREE_ROOT"`. Zed has no native select box, so the choice happens in the
+integrated terminal for every request. No task contains an environment name, value,
+or secret.
 
-```json
-[
-  {
-    "label": "HTTP: run request at cursor (local)",
-    "command": "zed-http \"$ZED_FILE\" --line \"$((ZED_ROW + 1))\" --environment \"local\" --project-root \"$ZED_WORKTREE_ROOT\"",
-    "tags": ["http-client-request"]
-  },
-  {
-    "label": "HTTP: run request at cursor (staging)",
-    "command": "zed-http \"$ZED_FILE\" --line \"$((ZED_ROW + 1))\" --environment \"staging\" --project-root \"$ZED_WORKTREE_ROOT\"",
-    "tags": ["http-client-request"]
-  },
-  {
-    "label": "HTTP: run request at cursor (production)",
-    "command": "zed-http \"$ZED_FILE\" --line \"$((ZED_ROW + 1))\" --environment \"production\" --project-root \"$ZED_WORKTREE_ROOT\"",
-    "tags": ["http-client-request"]
-  }
-]
+`--config PATH` and `--private-config PATH` select explicit public and private JSON
+environment configuration files.
+Otherwise the CLI searches upward from the request file and never goes above
+`--project-root`. Values resolve with this precedence: `--var` > inline declaration
+> private JSON configuration > public JSON configuration > process environment.
+
+Inline declarations have the form `@name = value` and appear before a request:
+
+```http
+@request_path = /status
+# @name get-status
+GET {{API_BASE_URL}}{{request_path}}
 ```
 
-`--config PATH` and `--private-config PATH` select explicit configuration files.
-Otherwise the CLI searches upward from the request file and never goes above
-`--project-root`. Values resolve with this precedence: `--var` > `--env-file` >
-private configuration > public configuration > process environment.
+They have forward lexical scope: a declaration applies to following requests,
+continues across `###`, and a later declaration does not alter an earlier request.
+The value is literal, including quotes and any `{{...}}` text. Inline declarations
+in request bodies are body content rather than variable declarations. They are
+stored in the `.http` file, so credentials do not belong in them.
 
 See the [format and security rules](docs/HTTP-FORMAT-AND-SECURITY.md) and the
 [Zed surface actually provided](docs/ZED-SURFACE.md). Requests are never run

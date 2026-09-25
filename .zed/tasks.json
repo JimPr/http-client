@@ -1,7 +1,7 @@
 [
   {
     "label": "HTTP: run request at cursor",
-    "command": "if ! command -v zed-http >/dev/null 2>&1; then\n  printf '%s\\n' 'ERROR: zed-http was not found on PATH. It is required to run HTTP requests.' 'Install it from the repository checkout root with: cargo install --path cli --locked' 'Documentation: https://github.com/JimPr/http-client#install-the-cli' 'No request was sent.' >&2\n  exit 127\nfi\nzed-http \"$ZED_FILE\" --line \"$((ZED_ROW + 1))\" --use-default-environment --project-root \"$ZED_WORKTREE_ROOT\"",
+    "command": "if ! command -v zed-http >/dev/null 2>&1; then\n  printf '%s\\n' 'ERROR: zed-http was not found on PATH. It is required to run HTTP requests.' 'Install it from the repository checkout root with: cargo install --path cli --locked' 'Documentation: https://github.com/JimPr/http-client#install-the-cli' 'No request was sent.' >&2\n  exit 127\nfi\nzed-http \"$ZED_FILE\" --line \"$((ZED_ROW + 1))\" --select-environment --project-root \"$ZED_WORKTREE_ROOT\"",
     "tags": ["http-client-request"],
     "save": "current",
     "use_new_terminal": true,

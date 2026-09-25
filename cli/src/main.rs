@@ -1,8 +1,15 @@
-use std::{collections::BTreeMap, env, fs, path::PathBuf, process::ExitCode, time::Duration};
+use std::{
+    collections::BTreeMap,
+    env, fs,
+    io::{self, BufReader},
+    path::PathBuf,
+    process::ExitCode,
+    time::Duration,
+};
 
 use zed_http_runner::{
-    execute, load_env_file, load_environment, merge_variable_sources, parse_document,
-    render_response, resolve_request, select_request, EnvironmentOptions, Selection,
+    execute, load_selected_environment, merge_variable_sources, parse_document, render_response,
+    resolve_request, select_environment, select_request, EnvironmentOptions, Selection,
 };
 
 const DEFAULT_TIMEOUT_SECONDS: u64 = 30;
@@ -28,10 +35,9 @@ fn run(arguments: Vec<String>) -> Result<String, String> {
     let mut selection = Selection::Index(0);
     let mut timeout_seconds = DEFAULT_TIMEOUT_SECONDS;
     let mut maximum_response_bytes = DEFAULT_MAX_RESPONSE_BYTES;
-    let mut environment_variables = BTreeMap::new();
     let mut explicit_variables = BTreeMap::new();
     let mut environment = None;
-    let mut use_default_environment = false;
+    let mut select_environment_interactively = false;
     let mut project_root = None;
     let mut config = None;
     let mut private_config = None;
@@ -42,6 +48,7 @@ fn run(arguments: Vec<String>) -> Result<String, String> {
                 index += 1;
                 selection = Selection::Name(argument(&arguments, index, "--name")?.into());
             }
+
             "--index" => {
                 index += 1;
                 selection = Selection::Index(
@@ -78,18 +85,11 @@ fn run(arguments: Vec<String>) -> Result<String, String> {
                     .ok_or_else(|| "--var expects NAME=VALUE".to_owned())?;
                 explicit_variables.insert(name.to_owned(), value.to_owned());
             }
-            "--env-file" => {
-                index += 1;
-                let path = argument(&arguments, index, "--env-file")?;
-                let loaded = load_env_file(std::path::Path::new(path))
-                    .map_err(|error| error.to_string())?;
-                environment_variables.extend(loaded);
-            }
             "--environment" => {
                 index += 1;
                 environment = Some(argument(&arguments, index, "--environment")?.into());
             }
-            "--use-default-environment" => use_default_environment = true,
+            "--select-environment" => select_environment_interactively = true,
             "--project-root" => {
                 index += 1;
                 project_root = Some(PathBuf::from(argument(&arguments, index, "--project-root")?));
@@ -106,24 +106,34 @@ fn run(arguments: Vec<String>) -> Result<String, String> {
         }
         index += 1;
     }
-    let selected_environment = load_environment(&EnvironmentOptions {
-        request_path: PathBuf::from(path),
-        environment,
-        use_default: use_default_environment,
-        project_root,
-        config,
-        private_config,
-    })
-    .map_err(|error| error.to_string())?;
-    environment_variables = merge_variable_sources(
-        selected_environment,
-        environment_variables,
-        explicit_variables,
-    );
-
+    if select_environment_interactively && environment.is_some() {
+        return Err("--select-environment cannot be used with --environment".to_owned());
+    }
     let source = fs::read_to_string(path).map_err(|error| format!("cannot read `{path}`: {error}"))?;
     let requests = parse_document(&source).map_err(|error| error.to_string())?;
     let request = select_request(&requests, selection).map_err(|error| error.to_string())?;
+    let environment_options = EnvironmentOptions {
+        request_path: PathBuf::from(path),
+        environment,
+        project_root,
+        config,
+        private_config,
+    };
+    let selected_environment = if select_environment_interactively {
+        let mut input = BufReader::new(io::stdin().lock());
+        let mut output = io::stderr().lock();
+        select_environment(&environment_options, &mut input, &mut output)
+    } else {
+        load_selected_environment(&environment_options)
+    }
+    .map_err(|error| error.to_string())?;
+    let environment_variables = merge_variable_sources(
+        selected_environment.values.clone(),
+        BTreeMap::new(),
+        request.inline_variables.clone(),
+        explicit_variables,
+    );
+
     let request =
         resolve_request(request, &environment_variables).map_err(|error| error.to_string())?;
     let response = execute(
@@ -132,7 +142,14 @@ fn run(arguments: Vec<String>) -> Result<String, String> {
         maximum_response_bytes,
     )
     .map_err(|error| error.to_string())?;
-    Ok(render_response(&response, maximum_response_bytes))
+    let environment_indicator = selected_environment
+        .name
+        .map(|name| format!("Environment: {name}\n"))
+        .unwrap_or_default();
+    Ok(format!(
+        "{environment_indicator}{}",
+        render_response(&response, maximum_response_bytes)
+    ))
 }
 
 fn argument<'a>(arguments: &'a [String], index: usize, option: &str) -> Result<&'a str, String> {
@@ -143,5 +160,5 @@ fn argument<'a>(arguments: &'a [String], index: usize, option: &str) -> Result<&
 }
 
 fn usage() -> String {
-    "usage: zed-http <file.http> [--name NAME | --index INDEX | --line LINE] [--environment NAME | --use-default-environment] [--project-root PATH] [--config PATH] [--private-config PATH] [--env-file .env] [--var NAME=VALUE] [--timeout-seconds N] [--max-response-bytes N]".into()
+    "usage: zed-http <file.http> [--name NAME | --index INDEX | --line LINE] [--environment NAME | --select-environment] [--project-root PATH] [--config PATH] [--private-config PATH] [--var NAME=VALUE] [--timeout-seconds N] [--max-response-bytes N]".into()
 }

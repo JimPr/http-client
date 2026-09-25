@@ -1,7 +1,5 @@
 /target/
 /cli/target/
 /grammars/
-.env
-.env.*
-!.env.example
 http-client.environments.private.json
+http-client.environments.json

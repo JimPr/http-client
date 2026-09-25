@@ -32,15 +32,15 @@ present_status=$?
 set -e
 test "$present_status" -eq 23
 test ! -s "$workspace/present.stderr"
-test "$(cat "$workspace/arguments")" = "$(printf "%s\\n" "/tmp/request file.http" "--line" "13" "--use-default-environment" "--project-root" "/tmp/zed-worktree")"
+test "$(cat "$workspace/arguments")" = "$(printf "%s\\n" "/tmp/request file.http" "--line" "13" "--select-environment" "--project-root" "/tmp/zed-worktree")"
 
-# The documented task variants remain explicit environment choices and retain the
-# runnable tag; no value assignment may be embedded in a task command.
-for environment in local staging production; do
-  grep -F -- "($environment)" "$repo_root/README.md" >/dev/null
-done
-grep -F -- "--environment" "$repo_root/README.md" >/dev/null
-grep -F -- '"http-client-request"' "$repo_root/README.md" >/dev/null
+# The target surface has one dynamic task; no static environment variant or variable
+# assignment may be embedded in its command.
+test "$(python3 -c "import json, sys; print(sum('http-client-request' in task.get('tags', []) for task in json.load(open(sys.argv[1]))))" "$repo_root/.zed/tasks.json")" -eq 1
+grep -F -- "--select-environment" "$repo_root/.zed/tasks.json" >/dev/null
+! grep -F -- "run request at cursor (local)" "$repo_root/README.md"
+! grep -F -- "run request at cursor (staging)" "$repo_root/README.md"
+! grep -F -- "run request at cursor (production)" "$repo_root/README.md"
 ! grep -E -- 'zed-http.*(--var|[[:space:]][A-Za-z_][A-Za-z0-9_]*=)' "$repo_root/README.md"
 
 printf "%s\\n" "Task guard tests passed."
