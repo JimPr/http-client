@@ -1,66 +1,77 @@
-# Comment exécuter une requête HTTP dans Zed
+# How to run HTTP requests in Zed
 
-## Prérequis
+## Prerequisites
 
-- Zed installé.
-- Rust et Cargo installés.
-- Un checkout de ce dépôt. Il est nécessaire pour installer le CLI.
+- Zed is installed.
+- The **HTTP Client Files** extension is installed from the Zed Extensions panel.
+- Rust and Cargo are installed to install the `zed-http` runner.
 
-## Étapes
+## Steps
 
-### 1. Installer l'extension locale
+### 1. Install the runner
 
-Dans Zed, ouvrez la palette de commandes et lancez **`zed: install dev extension`**.
-Sélectionnez la racine du checkout, celle qui contient `extension.toml`.
-
-### 2. Installer le CLI
-
-Depuis la racine du checkout de l'extension, exécutez :
+Clone this repository, then install the runner from its root:
 
 ```sh
+git clone https://github.com/JimPr/http-client.git
+cd http-client
 cargo install --path cli --locked
 ```
 
-Le binaire est installé dans `~/.cargo/bin`. Ajoutez ce répertoire à votre `PATH`
-si nécessaire, puis redémarrez complètement Zed :
+The command installs `zed-http` in `~/.cargo/bin`. Add that directory to your
+`PATH` if needed, then restart Zed:
 
 ```sh
 export PATH="$HOME/.cargo/bin:$PATH"
 ```
 
-### 3. Ajouter la tâche Zed
+### 2. Add the Zed task
 
-Dans Zed, ouvrez la palette de commandes puis lancez **`zed: open tasks`**. Ajoutez
-la tâche définie dans [`.zed/tasks.json`](../.zed/tasks.json) à votre fichier de
-tâches global `~/.config/zed/tasks.json`.
+Open the Command Palette and run **`zed: open tasks`**. Add the following task to
+your global tasks file:
 
-> **Note** : si vous préférez limiter la tâche à un seul projet, ajoutez la même
-> définition dans `<racine-du-projet>/.zed/tasks.json`.
-
-### 4. Exécuter les exemples publics
-
-Ouvrez [`examples/github-api.http`](../examples/github-api.http). Cliquez sur la
-flèche à gauche de `GET`, puis choisissez **HTTP: run request at cursor**.
-
-Vous devez voir dans le terminal intégré :
-
-- l'URL `raw.githubusercontent.com` ;
-- le statut `200` ;
-- le contenu JSON brut de `http-client.environments.example.json`.
-
-Placez ensuite le curseur sur `POST` et relancez la même tâche. Le terminal doit
-afficher un statut `200` et le HTML produit par l'API Markdown publique de GitHub.
-
-### 5. Configurer les environnements du projet
-
-Dans le projet contenant vos fichiers `.http`, créez le fichier de configuration :
-
-```sh
-cp /chemin/vers/http-client/http-client.environments.example.json \
-  http-client.environments.json
+```json
+[
+  {
+    "label": "HTTP: run request at cursor",
+    "command": "if ! command -v zed-http >/dev/null 2>&1; then\n  printf '%s\\n' 'ERROR: zed-http was not found on PATH. It is required to run HTTP requests.' 'Install it from the repository checkout root with: cargo install --path cli --locked' 'Documentation: https://github.com/JimPr/http-client#install-the-cli' 'No request was sent.' >&2\n  exit 127\nfi\nzed-http \"$ZED_FILE\" --line \"$((ZED_ROW + 1))\" --select-environment --project-root \"$ZED_WORKTREE_ROOT\"",
+    "tags": ["http-client-request"],
+    "save": "current",
+    "use_new_terminal": true,
+    "allow_concurrent_runs": true,
+    "reveal": "always",
+    "show_command": false
+  }
+]
 ```
 
-Adaptez les URL et valeurs partageables. Les environnements sont ordonnés :
+> **Note**: Merge this entry with existing tasks. To enable it in one project only,
+> add the same task to `<project-root>/.zed/tasks.json` instead.
+
+### 3. Run a request
+
+Create or open a `.http` file:
+
+```http
+# @name download-example
+@raw_github = https://raw.githubusercontent.com
+GET {{raw_github}}/JimPr/http-client/main/http-client.environments.example.json
+Accept: application/json
+```
+
+Place the cursor on the `GET` line and click the gutter arrow. Select
+**HTTP: run request at cursor**. The integrated terminal shows the URL, status,
+headers, and response body.
+
+You can also open
+[`examples/github-api.http`](../examples/github-api.http) from the cloned
+repository. It includes the public `GET` request above and a public GitHub `POST`
+request.
+
+### 4. Configure project environments
+
+Create `http-client.environments.json` in the root of the project containing your
+`.http` files:
 
 ```json
 {
@@ -82,17 +93,16 @@ Adaptez les URL et valeurs partageables. Les environnements sont ordonnés :
 }
 ```
 
-À chaque exécution, Zed ouvre le terminal avec la liste des environnements. Entrez
-le numéro souhaité ou appuyez sur <kbd>Entrée</kbd> pour choisir le premier.
+Run a request again. The integrated terminal lists the environments. Enter a number
+to select one, or press <kbd>Enter</kbd> to select the first item for that request.
 
-> **Note** : sans `http-client.environments.json`, aucune liste n'est affichée : la
-> requête est lancée directement.
+> **Note**: Without `http-client.environments.json`, no picker is displayed and the
+> request runs directly.
 
-### 6. Conserver les secrets hors Git
+### 5. Keep secrets out of Git
 
-Créez `http-client.environments.private.json` à la racine du projet pour les tokens
-et autres valeurs locales. Il surcharge les valeurs du fichier public pour
-l'environnement choisi et est ignoré par Git :
+Create `http-client.environments.private.json` in the same project root for local
+tokens and other secrets:
 
 ```json
 {
@@ -101,31 +111,32 @@ l'environnement choisi et est ignoré par Git :
     {
       "name": "staging",
       "variables": {
-        "API_TOKEN": "valeur-locale"
+        "API_TOKEN": "local-value"
       }
     }
   ]
 }
 ```
 
-Utilisez ensuite les variables dans un fichier HTTP :
+Its values override the selected public environment and the file is ignored by Git.
+Use the variables in a request:
 
 ```http
 GET {{API_BASE_URL}}/status
 Authorization: Bearer {{API_TOKEN}}
 ```
 
-## Vérification
+## Verification
 
-Après l'exécution, le terminal intégré affiche l'environnement choisi, l'URL finale,
-le statut HTTP, les en-têtes et le corps de la réponse.
+After a request finishes, the integrated terminal shows the selected environment,
+the final URL, the HTTP status, headers, and the response body.
 
-## Problèmes courants
+## Common problems
 
-- **`zed-http was not found on PATH`** : ajoutez `~/.cargo/bin` au `PATH`, puis
-  redémarrez Zed.
-- **Aucun sélecteur d'environnement** : créez
-  `http-client.environments.json` à la racine du worktree contenant le fichier
-  `.http`.
-- **Variable non définie** : ajoutez-la dans l'environnement sélectionné, dans le
-  fichier privé, ou avant la requête avec `@nom = valeur`.
+- **`zed-http was not found on PATH`**: Add `~/.cargo/bin` to `PATH`, then restart
+  Zed.
+- **No environment picker is shown**: Create `http-client.environments.json` in the
+  worktree that contains the `.http` file.
+- **A variable is not defined**: Add it to the selected environment, the private
+  environment file, or an inline declaration before the request, such as
+  `@name = value`.
