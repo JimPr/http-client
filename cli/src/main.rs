@@ -8,8 +8,9 @@ use std::{
 };
 
 use zed_http_runner::{
-    execute, load_selected_environment, merge_variable_sources, parse_document, render_response,
-    resolve_request, select_environment, select_request, EnvironmentOptions, Selection,
+    EnvironmentOptions, Selection, execute, load_selected_environment, merge_variable_sources,
+    parse_document, render_response, resolve_request, save_response_body, select_environment,
+    select_request,
 };
 
 const DEFAULT_TIMEOUT_SECONDS: u64 = 30;
@@ -92,7 +93,11 @@ fn run(arguments: Vec<String>) -> Result<String, String> {
             "--select-environment" => select_environment_interactively = true,
             "--project-root" => {
                 index += 1;
-                project_root = Some(PathBuf::from(argument(&arguments, index, "--project-root")?));
+                project_root = Some(PathBuf::from(argument(
+                    &arguments,
+                    index,
+                    "--project-root",
+                )?));
             }
             "--config" => {
                 index += 1;
@@ -100,7 +105,11 @@ fn run(arguments: Vec<String>) -> Result<String, String> {
             }
             "--private-config" => {
                 index += 1;
-                private_config = Some(PathBuf::from(argument(&arguments, index, "--private-config")?));
+                private_config = Some(PathBuf::from(argument(
+                    &arguments,
+                    index,
+                    "--private-config",
+                )?));
             }
             option => return Err(format!("unknown option `{option}`\n{}", usage())),
         }
@@ -109,13 +118,15 @@ fn run(arguments: Vec<String>) -> Result<String, String> {
     if select_environment_interactively && environment.is_some() {
         return Err("--select-environment cannot be used with --environment".to_owned());
     }
-    let source = fs::read_to_string(path).map_err(|error| format!("cannot read `{path}`: {error}"))?;
+    let request_path = PathBuf::from(path);
+    let source =
+        fs::read_to_string(path).map_err(|error| format!("cannot read `{path}`: {error}"))?;
     let requests = parse_document(&source).map_err(|error| error.to_string())?;
     let request = select_request(&requests, selection).map_err(|error| error.to_string())?;
     let environment_options = EnvironmentOptions {
-        request_path: PathBuf::from(path),
+        request_path: request_path.clone(),
         environment,
-        project_root,
+        project_root: project_root.clone(),
         config,
         private_config,
     };
@@ -142,13 +153,23 @@ fn run(arguments: Vec<String>) -> Result<String, String> {
         maximum_response_bytes,
     )
     .map_err(|error| error.to_string())?;
+    let saved_body =
+        save_response_body(&response, &request, &request_path, project_root.as_deref())
+            .map_err(|error| error.to_string())?;
     let environment_indicator = selected_environment
         .name
         .map(|name| format!("Environment: {name}\n"))
         .unwrap_or_default();
+    let truncation = if saved_body.truncated {
+        ", truncated"
+    } else {
+        ""
+    };
     Ok(format!(
-        "{environment_indicator}{}",
-        render_response(&response, maximum_response_bytes)
+        "{environment_indicator}{}Saved response body: {} ({} bytes{truncation})\n",
+        render_response(&response, maximum_response_bytes),
+        saved_body.path.display(),
+        saved_body.byte_count,
     ))
 }
 

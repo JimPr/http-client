@@ -92,9 +92,21 @@ being used.
 - The default maximum timeout is 30 seconds; adjust it with
   `--timeout-seconds`.
 - The response body is capped at 1 MiB by default with `--max-response-bytes`; any
-  truncation is reported.
+  truncation is reported. The captured prefix is saved byte-for-byte; no truncation
+  marker is inserted into the saved file.
 - Output contains the final URL, status, duration, size, headers, and body. JSON is
-  formatted; binary bodies are deliberately omitted.
+  formatted; binary bodies are deliberately omitted. The last output line identifies
+  the absolute saved-body path, its captured size, and truncation state.
+- Every response, including 4xx/5xx, empty, and binary bodies, is saved under
+  `<project-root>/.zed/http-client/` (or beside the `.http` file when no root is
+  supplied). With `--project-root`, the `.http` file must be inside its canonical
+  root. Response paths never use URLs, response headers, or
+  `Content-Disposition`; names use a sanitized request identifier, UTC timestamp,
+  process ID, and collision-resistant counter.
+- The extension is selected from a closed Content-Type mapping. Unknown non-text
+  types save as `.bin`; unknown `text/*` types save as `.txt`. No content sniffing
+  occurs. On supported Unix systems, generated directories and files are restricted
+  to the current user.
 - Variable values, including tokens, are never written to CLI diagnostics.
 - Inline declaration values are stored in the request file. Keep secrets in an
   ignored private JSON environment file instead of inline declarations.
@@ -102,4 +114,5 @@ being used.
   file or in task commands; the included environment example is deliberately
   secret-free.
 Never commit secrets. The private JSON environment file is the only ignored external
-configuration file supported by the CLI.
+configuration file supported by the CLI. Generated response bodies are also
+Git-ignored and can contain sensitive server data, so review them before sharing.

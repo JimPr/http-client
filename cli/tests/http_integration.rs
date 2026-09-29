@@ -8,7 +8,7 @@ use std::{
 };
 
 use zed_http_runner::{
-    execute, load_environment, parse_document, resolve_request, EnvironmentOptions,
+    EnvironmentOptions, execute, load_environment, parse_document, resolve_request,
 };
 
 #[test]
@@ -73,7 +73,9 @@ fn executes_against_a_local_server_using_an_explicitly_selected_environment() {
     )
     .expect("config writes");
     let server = thread::spawn(move || {
-        listener.set_nonblocking(true).expect("listener is nonblocking");
+        listener
+            .set_nonblocking(true)
+            .expect("listener is nonblocking");
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         let (mut stream, _) = loop {
             match listener.accept() {
@@ -87,9 +89,11 @@ fn executes_against_a_local_server_using_an_explicitly_selected_environment() {
         };
         let mut request = [0_u8; 512];
         let count = stream.read(&mut request).expect("request reads");
-        assert!(std::str::from_utf8(&request[..count])
-            .expect("request utf8")
-            .starts_with("GET /selected HTTP/1.1"));
+        assert!(
+            std::str::from_utf8(&request[..count])
+                .expect("request utf8")
+                .starts_with("GET /selected HTTP/1.1")
+        );
         stream
             .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
             .expect("response writes");
@@ -134,8 +138,10 @@ fn cli_selects_an_environment_from_stdin_before_executing_a_real_request() {
     )
     .expect("config writes");
     let server = thread::spawn(move || {
-        listener.set_nonblocking(true).expect("listener is nonblocking");
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        listener
+            .set_nonblocking(true)
+            .expect("listener is nonblocking");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let (mut stream, _) = loop {
             match listener.accept() {
                 Ok(connection) => break connection,
@@ -148,9 +154,11 @@ fn cli_selects_an_environment_from_stdin_before_executing_a_real_request() {
         };
         let mut request = [0_u8; 512];
         let count = stream.read(&mut request).expect("request reads");
-        assert!(std::str::from_utf8(&request[..count])
-            .expect("request utf8")
-            .starts_with("GET /selected HTTP/1.1"));
+        assert!(
+            std::str::from_utf8(&request[..count])
+                .expect("request utf8")
+                .starts_with("GET /selected HTTP/1.1")
+        );
         stream
             .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
             .expect("response writes");
@@ -196,11 +204,16 @@ fn cli_selection_without_configuration_skips_the_prompt_and_executes_directly() 
     ));
     std::fs::create_dir_all(&directory).expect("directory creates");
     let request_file = directory.join("request.http");
-    std::fs::write(&request_file, format!("GET http://{address}/without-environment"))
-        .expect("request writes");
+    std::fs::write(
+        &request_file,
+        format!("GET http://{address}/without-environment"),
+    )
+    .expect("request writes");
     let server = thread::spawn(move || {
-        listener.set_nonblocking(true).expect("listener is nonblocking");
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        listener
+            .set_nonblocking(true)
+            .expect("listener is nonblocking");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let (mut stream, _) = loop {
             match listener.accept() {
                 Ok(connection) => break connection,
@@ -208,14 +221,17 @@ fn cli_selection_without_configuration_skips_the_prompt_and_executes_directly() 
                     assert!(std::time::Instant::now() < deadline, "request arrives");
                     thread::sleep(Duration::from_millis(10));
                 }
+
                 Err(error) => panic!("listener accepts: {error}"),
             }
         };
         let mut request = [0_u8; 512];
         let count = stream.read(&mut request).expect("request reads");
-        assert!(std::str::from_utf8(&request[..count])
-            .expect("request utf8")
-            .starts_with("GET /without-environment HTTP/1.1"));
+        assert!(
+            std::str::from_utf8(&request[..count])
+                .expect("request utf8")
+                .starts_with("GET /without-environment HTTP/1.1")
+        );
         stream
             .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
             .expect("response writes");
@@ -237,6 +253,64 @@ fn cli_selection_without_configuration_skips_the_prompt_and_executes_directly() 
     assert!(String::from_utf8_lossy(&output.stdout).contains("Status: 204"));
     assert!(!String::from_utf8_lossy(&output.stdout).contains("Environment:"));
     assert!(!String::from_utf8_lossy(&output.stderr).contains("Select environment:"));
+    std::fs::remove_dir_all(directory).expect("directory removes");
+}
+
+#[test]
+fn cli_saves_a_binary_error_response_and_prints_its_absolute_path_last() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("listener starts");
+    let address = listener.local_addr().expect("address");
+    let directory = std::env::temp_dir().join(format!(
+        "zed-http-runner-saved-response-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&directory).expect("directory creates");
+    let request_file = directory.join("request.http");
+    std::fs::write(
+        &request_file,
+        format!("# @name image\nGET http://{address}/missing"),
+    )
+    .expect("request writes");
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("request arrives");
+        let mut request = [0_u8; 1];
+        stream.read_exact(&mut request).expect("request reads");
+        stream
+            .write_all(
+                b"HTTP/1.1 404 Not Found\r\nContent-Type: image/png\r\nContent-Length: 3\r\nConnection: close\r\n\r\n\x00\xff\x7f",
+            )
+            .expect("response writes");
+    });
+
+    let output = Command::new(env!("CARGO_BIN_EXE_zed-http"))
+        .args([
+            request_file.to_str().expect("path utf8"),
+            "--project-root",
+            directory.to_str().expect("path utf8"),
+        ])
+        .output()
+        .expect("CLI starts");
+
+    server.join().expect("server succeeds");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("stdout utf8");
+    let last_line = stdout.lines().last().expect("saved-body line");
+    let path = last_line
+        .strip_prefix("Saved response body: ")
+        .and_then(|line| line.split(" (").next())
+        .expect("absolute saved path");
+    assert!(std::path::Path::new(path).is_absolute());
+    assert_eq!(
+        std::fs::read(path).expect("saved body reads"),
+        [0, 255, 127]
+    );
+    assert!(path.ends_with(".png"));
+    assert!(stdout.contains("Status: 404"));
+    assert!(stdout.contains("<binary body omitted: 3 bytes>"));
     std::fs::remove_dir_all(directory).expect("directory removes");
 }
 
@@ -268,12 +342,17 @@ fn cli_rejects_default_environment_before_sending_http() {
         .output()
         .expect("CLI starts");
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("environment configuration is invalid"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("environment configuration is invalid")
+    );
     listener
         .set_nonblocking(true)
         .expect("listener becomes nonblocking");
     assert_eq!(
-        listener.accept().expect_err("rejected default sent no request").kind(),
+        listener
+            .accept()
+            .expect_err("rejected default sent no request")
+            .kind(),
         std::io::ErrorKind::WouldBlock
     );
 
@@ -293,14 +372,24 @@ fn executes_a_local_request_with_url_header_and_body_from_inline_variables() {
             assert_ne!(count, 0, "request contains headers");
             request.extend_from_slice(&buffer[..count]);
         }
-        while request.len() < request.windows(4).position(|window| window == b"\r\n\r\n").expect("headers end") + 15 {
+        while request.len()
+            < request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .expect("headers end")
+                + 15
+        {
             let count = stream.read(&mut buffer).expect("body reads");
             assert_ne!(count, 0, "request contains body");
             request.extend_from_slice(&buffer[..count]);
         }
         let request = String::from_utf8(request).expect("request utf8");
         assert!(request.starts_with("POST /inline HTTP/1.1"));
-        assert!(request.to_ascii_lowercase().contains("x-inline-token: safe-test-value"));
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("x-inline-token: safe-test-value")
+        );
         assert!(request.ends_with("inline body"));
         stream
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")

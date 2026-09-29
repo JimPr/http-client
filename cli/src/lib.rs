@@ -7,20 +7,24 @@ use std::{
     collections::BTreeMap,
     fs,
     io::{BufRead, Read, Write},
-    path::Path,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 
+use chrono::Utc;
 use reqwest::{
+    Method,
     blocking::Client,
     header::{HeaderName, HeaderValue},
     redirect::Policy,
-    Method,
 };
 use serde::Deserialize;
 use thiserror::Error;
 
 const MAX_REDIRECTS: usize = 10;
+const SAVE_ATTEMPTS: u64 = 32;
+static RESPONSE_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Error)]
 pub enum HttpFileError {
@@ -54,6 +58,8 @@ pub enum HttpFileError {
     RequestFailed,
     #[error("response body could not be read: {0}")]
     ResponseRead(#[from] std::io::Error),
+    #[error("response body could not be saved")]
+    ResponseSave,
     #[error("environment configuration could not be read")]
     EnvironmentConfigurationRead,
     #[error("environment configuration is invalid")]
@@ -132,7 +138,9 @@ pub fn load_selected_environment(
     let source = environment_source(public.as_ref(), private.as_ref());
     let selected = options.environment.clone();
     match selected {
-        Some(selected) => selected_environment(&selected, source, public.as_ref(), private.as_ref()),
+        Some(selected) => {
+            selected_environment(&selected, source, public.as_ref(), private.as_ref())
+        }
         None => Ok(SelectedEnvironment {
             name: None,
             values: BTreeMap::new(),
@@ -157,14 +165,18 @@ pub fn select_environment<R: BufRead, W: Write>(
             values: BTreeMap::new(),
         });
     };
-    writeln!(writer, "Select environment:").map_err(|_| HttpFileError::EnvironmentSelectionCancelled)?;
+    writeln!(writer, "Select environment:")
+        .map_err(|_| HttpFileError::EnvironmentSelectionCancelled)?;
     for (index, environment) in source.environments.iter().enumerate() {
-        let preselected = (index == 0).then_some(" (preselected)").unwrap_or_default();
+        let preselected = if index == 0 { " (preselected)" } else { "" };
         writeln!(writer, "  {}. {}{preselected}", index + 1, environment.name)
             .map_err(|_| HttpFileError::EnvironmentSelectionCancelled)?;
     }
-    write!(writer, "Enter a number [1]: ").map_err(|_| HttpFileError::EnvironmentSelectionCancelled)?;
-    writer.flush().map_err(|_| HttpFileError::EnvironmentSelectionCancelled)?;
+    write!(writer, "Enter a number [1]: ")
+        .map_err(|_| HttpFileError::EnvironmentSelectionCancelled)?;
+    writer
+        .flush()
+        .map_err(|_| HttpFileError::EnvironmentSelectionCancelled)?;
     let mut input = String::new();
     if reader
         .read_line(&mut input)
@@ -190,7 +202,13 @@ pub fn select_environment<R: BufRead, W: Write>(
 
 fn read_environment_configurations(
     options: &EnvironmentOptions,
-) -> Result<(Option<EnvironmentConfiguration>, Option<EnvironmentConfiguration>), HttpFileError> {
+) -> Result<
+    (
+        Option<EnvironmentConfiguration>,
+        Option<EnvironmentConfiguration>,
+    ),
+    HttpFileError,
+> {
     let (public_path, private_path) = configuration_paths(options);
     Ok((
         read_environment_configuration(public_path.as_deref())?,
@@ -265,7 +283,9 @@ fn discover_configuration_paths(
     request_path: &Path,
     project_root: Option<&Path>,
 ) -> (Option<std::path::PathBuf>, Option<std::path::PathBuf>) {
-    let Some(mut directory) = request_path.parent().and_then(|path| path.canonicalize().ok())
+    let Some(mut directory) = request_path
+        .parent()
+        .and_then(|path| path.canonicalize().ok())
     else {
         return (None, None);
     };
@@ -309,17 +329,18 @@ fn read_environment_configuration(
     let Some(path) = path else {
         return Ok(None);
     };
-    let source = fs::read_to_string(path).map_err(|_| HttpFileError::EnvironmentConfigurationRead)?;
-    let document: serde_json::Value =
-        serde_json::from_str(&source).map_err(|_| HttpFileError::InvalidEnvironmentConfiguration)?;
+    let source =
+        fs::read_to_string(path).map_err(|_| HttpFileError::EnvironmentConfigurationRead)?;
+    let document: serde_json::Value = serde_json::from_str(&source)
+        .map_err(|_| HttpFileError::InvalidEnvironmentConfiguration)?;
     match document.get("version").and_then(serde_json::Value::as_u64) {
         Some(1) => return Err(HttpFileError::LegacyEnvironmentConfigurationVersion),
         Some(2) => {}
         Some(_) => return Err(HttpFileError::UnsupportedEnvironmentConfigurationVersion),
         None => return Err(HttpFileError::InvalidEnvironmentConfiguration),
     }
-    let configuration: EnvironmentConfiguration =
-        serde_json::from_str(&source).map_err(|_| HttpFileError::InvalidEnvironmentConfiguration)?;
+    let configuration: EnvironmentConfiguration = serde_json::from_str(&source)
+        .map_err(|_| HttpFileError::InvalidEnvironmentConfiguration)?;
     debug_assert_eq!(configuration.version, 2);
     validate_environment_configuration(&configuration)?;
     Ok(Some(configuration))
@@ -419,8 +440,7 @@ pub fn parse_document(source: &str) -> Result<Vec<HttpRequest>, HttpFileError> {
     for (offset, line) in source.lines().enumerate() {
         let line_number = offset + 1;
         if line.trim_start().starts_with("###") {
-            if let Some(request) =
-                parse_block(&block, pending_name.take(), &mut inline_variables)?
+            if let Some(request) = parse_block(&block, pending_name.take(), &mut inline_variables)?
             {
                 requests.push(request);
             }
@@ -487,7 +507,10 @@ fn parse_block(
         let Some((header_name, header_value)) = line.split_once(':') else {
             return Err(HttpFileError::InvalidHeader { line: line_number });
         };
-        headers.push((header_name.trim().to_owned(), header_value.trim().to_owned()));
+        headers.push((
+            header_name.trim().to_owned(),
+            header_value.trim().to_owned(),
+        ));
         cursor += 1;
     }
     if cursor < lines.len() {
@@ -524,19 +547,19 @@ fn parse_inline_declaration(
     };
     let name = name.trim();
     if name.is_empty()
-        || !name
-            .chars()
-            .all(|character| character.is_alphanumeric() || matches!(character, '_' | '.' | '$' | '-'))
+        || !name.chars().all(|character| {
+            character.is_alphanumeric() || matches!(character, '_' | '.' | '$' | '-')
+        })
     {
         return Err(HttpFileError::InvalidInlineVariableDeclaration { line: line_number });
     }
     Ok((name.to_owned(), value.trim().to_owned()))
 }
 
-pub fn select_request<'a>(
-    requests: &'a [HttpRequest],
+pub fn select_request(
+    requests: &[HttpRequest],
     selection: Selection,
-) -> Result<&'a HttpRequest, HttpFileError> {
+) -> Result<&HttpRequest, HttpFileError> {
     match selection {
         Selection::Name(name) => requests
             .iter()
@@ -611,6 +634,201 @@ pub struct ResponseData {
     pub truncated: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedResponseBody {
+    pub path: PathBuf,
+    pub byte_count: usize,
+    pub truncated: bool,
+}
+
+/// Persists the captured response bytes beneath the project-local Zed data directory.
+/// The output path never incorporates server-controlled data.
+pub fn save_response_body(
+    response: &ResponseData,
+    request: &HttpRequest,
+    request_path: &Path,
+    project_root: Option<&Path>,
+) -> Result<SavedResponseBody, HttpFileError> {
+    let root = response_storage_root(request_path, project_root)?;
+    let storage_parent = root.join(".zed");
+    fs::create_dir_all(&storage_parent).map_err(|_| HttpFileError::ResponseSave)?;
+    let storage_parent = storage_parent
+        .canonicalize()
+        .map_err(|_| HttpFileError::ResponseSave)?;
+    if !storage_parent.starts_with(&root) {
+        return Err(HttpFileError::ResponseSave);
+    }
+    let directory = storage_parent.join("http-client");
+    fs::create_dir_all(&directory).map_err(|_| HttpFileError::ResponseSave)?;
+    let directory = directory
+        .canonicalize()
+        .map_err(|_| HttpFileError::ResponseSave)?;
+    if !directory.starts_with(&root) {
+        return Err(HttpFileError::ResponseSave);
+    }
+    restrict_directory_permissions(&directory).map_err(|_| HttpFileError::ResponseSave)?;
+
+    let label = sanitize_file_component(
+        request
+            .name
+            .as_deref()
+            .unwrap_or(&format!("{:?}-line-{}", request.method, request.start_line)),
+    );
+    let extension = response_file_extension(
+        response
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+            .map(|(_, value)| value.as_str()),
+    );
+    let timestamp = Utc::now().format("%Y%m%dT%H%M%SZ");
+    let process_id = std::process::id();
+
+    for _ in 0..SAVE_ATTEMPTS {
+        let counter = RESPONSE_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = directory.join(format!(
+            "{timestamp}-{label}-{process_id}-{counter}.{extension}"
+        ));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                if restrict_file_permissions(&file).is_err() {
+                    drop(file);
+                    let _ = fs::remove_file(&path);
+                    return Err(HttpFileError::ResponseSave);
+                }
+                if file.write_all(&response.body).is_err() || file.sync_all().is_err() {
+                    drop(file);
+                    let _ = fs::remove_file(&path);
+                    return Err(HttpFileError::ResponseSave);
+                }
+                return Ok(SavedResponseBody {
+                    path,
+                    byte_count: response.body.len(),
+                    truncated: response.truncated,
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return Err(HttpFileError::ResponseSave),
+        }
+    }
+    Err(HttpFileError::ResponseSave)
+}
+
+fn response_storage_root(
+    request_path: &Path,
+    project_root: Option<&Path>,
+) -> Result<PathBuf, HttpFileError> {
+    let request_path = request_path
+        .canonicalize()
+        .map_err(|_| HttpFileError::ResponseSave)?;
+    match project_root {
+        Some(root) => {
+            let root = root
+                .canonicalize()
+                .map_err(|_| HttpFileError::ResponseSave)?;
+            if !request_path.starts_with(&root) {
+                return Err(HttpFileError::ResponseSave);
+            }
+            Ok(root)
+        }
+        None => request_path
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or(HttpFileError::ResponseSave),
+    }
+}
+
+fn response_file_extension(content_type: Option<&str>) -> &'static str {
+    let media_type = content_type
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase());
+    let Some(media_type) = media_type else {
+        return "bin";
+    };
+    if media_type == "application/json" || media_type.ends_with("+json") {
+        return "json";
+    }
+    if media_type == "application/xhtml+xml" {
+        return "html";
+    }
+    if media_type == "application/xml" || media_type == "text/xml" || media_type.ends_with("+xml") {
+        return "xml";
+    }
+    match media_type.as_str() {
+        "text/html" => "html",
+        "text/css" => "css",
+        "application/javascript" | "text/javascript" => "js",
+        "application/typescript" | "text/typescript" => "ts",
+        "text/markdown" | "text/x-markdown" => "md",
+        "application/yaml" | "application/x-yaml" | "text/yaml" | "text/x-yaml" => "yaml",
+        "text/csv" => "csv",
+        "application/graphql" | "application/x-graphql" => "graphql",
+        "application/pdf" => "pdf",
+        "image/jpeg" => "jpg",
+        "image/png" => "png",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/svg+xml" => "svg",
+        "application/zip" => "zip",
+        "application/gzip" => "gz",
+        "application/x-tar" => "tar",
+        "application/x-7z-compressed" => "7z",
+        "application/x-rar-compressed" => "rar",
+        "audio/mpeg" => "mp3",
+        "audio/ogg" => "ogg",
+        "video/mp4" => "mp4",
+        "video/webm" => "webm",
+        "application/wasm" => "wasm",
+        value if value.starts_with("text/") => "txt",
+        _ => "bin",
+    }
+}
+
+fn sanitize_file_component(value: &str) -> String {
+    let value: String = value
+        .chars()
+        .map(|character| match character {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => character,
+            _ => '_',
+        })
+        .take(48)
+        .collect();
+    let value = value.trim_matches('_');
+    if value.is_empty() {
+        "response".into()
+    } else {
+        value.into()
+    }
+}
+
+#[cfg(unix)]
+fn restrict_directory_permissions(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(not(unix))]
+fn restrict_directory_permissions(_: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn restrict_file_permissions(file: &fs::File) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn restrict_file_permissions(_: &fs::File) -> std::io::Result<()> {
+    Ok(())
+}
+
 /// Performs one explicitly selected request. TLS certificate validation remains enabled.
 pub fn execute(
     request: &HttpRequest,
@@ -646,7 +864,12 @@ pub fn execute(
     let headers = response
         .headers()
         .iter()
-        .map(|(name, value)| (name.to_string(), value.to_str().unwrap_or("<non-UTF-8>").into()))
+        .map(|(name, value)| {
+            (
+                name.to_string(),
+                value.to_str().unwrap_or("<non-UTF-8>").into(),
+            )
+        })
         .collect();
     let (body, truncated) = read_response_body(&mut response, maximum_response_bytes)?;
 
@@ -713,4 +936,179 @@ fn render_body(body: &[u8]) -> String {
 
 fn binary_body_message(byte_count: usize) -> String {
     format!("<binary body omitted: {byte_count} bytes>\n")
+}
+
+#[cfg(test)]
+mod response_storage_tests {
+    use super::*;
+    use std::{sync::Arc, thread};
+
+    #[test]
+    fn maps_normalized_and_unknown_content_types_to_the_closed_extension_set() {
+        for (content_type, extension) in [
+            (" Application/Problem+JSON ; charset=UTF-8 ", "json"),
+            ("application/hal+xml; charset=utf-8", "xml"),
+            ("application/xhtml+xml", "html"),
+            ("text/unknown", "txt"),
+            ("image/png", "png"),
+            ("application/not-known", "bin"),
+            ("not a media type", "bin"),
+        ] {
+            assert_eq!(response_file_extension(Some(content_type)), extension);
+        }
+        assert_eq!(response_file_extension(None), "bin");
+    }
+
+    #[test]
+    fn saves_empty_truncated_bodies_and_uses_the_request_parent_without_a_root() {
+        let directory = unique_test_directory("fallback");
+        let request_path = directory.join("request.http");
+        fs::write(&request_path, "GET http://example.test/").expect("request writes");
+        let request = parse_document("GET http://example.test/")
+            .expect("request parses")
+            .remove(0);
+        let response = ResponseData {
+            final_url: "http://example.test/".into(),
+            status: 204,
+            duration_ms: 1,
+            headers: vec![],
+            body: vec![],
+            truncated: true,
+        };
+
+        let saved =
+            save_response_body(&response, &request, &request_path, None).expect("response saves");
+
+        assert_eq!(saved.byte_count, 0);
+        assert!(saved.truncated);
+        assert_eq!(fs::read(saved.path).expect("body reads"), b"");
+        fs::remove_dir_all(directory).expect("directory removes");
+    }
+
+    #[test]
+    fn refuses_to_save_when_the_http_file_is_outside_the_supplied_root() {
+        let base = unique_test_directory("confinement");
+        let root = base.join("root");
+        let outside = base.join("outside");
+        fs::create_dir_all(&root).expect("root creates");
+        fs::create_dir_all(&outside).expect("outside creates");
+        let request_path = outside.join("request.http");
+        fs::write(&request_path, "GET http://example.test/").expect("request writes");
+        let request = parse_document("GET http://example.test/")
+            .expect("request parses")
+            .remove(0);
+        let response = test_response();
+
+        let error = save_response_body(&response, &request, &request_path, Some(&root))
+            .expect_err("outside request rejects");
+
+        assert_eq!(error.to_string(), "response body could not be saved");
+        assert!(!root.join(".zed/http-client").exists());
+        fs::remove_dir_all(base).expect("directory removes");
+    }
+
+    #[test]
+    fn reports_a_write_error_without_creating_a_body_when_the_storage_path_is_a_file() {
+        let directory = unique_test_directory("write-error");
+        let request_path = directory.join("request.http");
+        fs::write(&request_path, "GET http://example.test/").expect("request writes");
+        fs::write(directory.join(".zed"), "not a directory").expect("blocking file writes");
+        let request = parse_document("GET http://example.test/")
+            .expect("request parses")
+            .remove(0);
+
+        let error = save_response_body(&test_response(), &request, &request_path, Some(&directory))
+            .expect_err("storage path rejects");
+
+        assert_eq!(error.to_string(), "response body could not be saved");
+        assert!(!directory.join(".zed/http-client").exists());
+        fs::remove_dir_all(directory).expect("directory removes");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_a_symlinked_storage_directory_that_escapes_the_project_root() {
+        use std::os::unix::fs::symlink;
+
+        let base = unique_test_directory("symlink");
+        let root = base.join("root");
+        let outside = base.join("outside");
+        fs::create_dir_all(&root).expect("root creates");
+        fs::create_dir_all(&outside).expect("outside creates");
+        symlink(&outside, root.join(".zed")).expect("symlink creates");
+        let request_path = root.join("request.http");
+        fs::write(&request_path, "GET http://example.test/").expect("request writes");
+        let request = parse_document("GET http://example.test/")
+            .expect("request parses")
+            .remove(0);
+
+        let error = save_response_body(&test_response(), &request, &request_path, Some(&root))
+            .expect_err("escaping symlink rejects");
+
+        assert_eq!(error.to_string(), "response body could not be saved");
+        assert!(!outside.join("http-client").exists());
+        fs::remove_dir_all(base).expect("directory removes");
+    }
+
+    #[test]
+    fn concurrent_saves_use_distinct_files_without_changing_bytes() {
+        let directory = unique_test_directory("concurrent");
+        let request_path = directory.join("request.http");
+        fs::write(&request_path, "GET http://example.test/").expect("request writes");
+        let request = Arc::new(
+            parse_document("GET http://example.test/")
+                .expect("request parses")
+                .remove(0),
+        );
+        let response = Arc::new(test_response());
+        let first = {
+            let request = Arc::clone(&request);
+            let response = Arc::clone(&response);
+            let request_path = request_path.clone();
+            let directory = directory.clone();
+            thread::spawn(move || {
+                save_response_body(&response, &request, &request_path, Some(&directory))
+            })
+        };
+        let second = {
+            let request = Arc::clone(&request);
+            let response = Arc::clone(&response);
+            let request_path = request_path.clone();
+            let directory = directory.clone();
+            thread::spawn(move || {
+                save_response_body(&response, &request, &request_path, Some(&directory))
+            })
+        };
+
+        let first = first.join().expect("first thread").expect("first saves");
+        let second = second.join().expect("second thread").expect("second saves");
+        assert_ne!(first.path, second.path);
+        assert_eq!(fs::read(first.path).expect("first reads"), [0, 255, 42]);
+        assert_eq!(fs::read(second.path).expect("second reads"), [0, 255, 42]);
+        fs::remove_dir_all(directory).expect("directory removes");
+    }
+
+    fn test_response() -> ResponseData {
+        ResponseData {
+            final_url: "http://example.test/".into(),
+            status: 200,
+            duration_ms: 1,
+            headers: vec![("content-type".into(), "application/octet-stream".into())],
+            body: vec![0, 255, 42],
+            truncated: false,
+        }
+    }
+
+    fn unique_test_directory(label: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "zed-http-runner-response-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&path).expect("directory creates");
+        path
+    }
 }

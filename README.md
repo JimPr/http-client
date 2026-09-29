@@ -26,6 +26,12 @@ currently guaranteed is from a repository checkout root:
 cargo install --path cli --locked
 ```
 
+After changing anything in `cli/`, rebuild and reinstall the binary:
+
+```sh
+cargo install --path cli --locked --force
+```
+
 This installs `zed-http` into Cargo's bin directory, which must be on `PATH`. Zed
 inherits its `PATH` when it starts: fully restart Zed after changing `PATH` so the
 task can find the newly installed binary.
@@ -54,7 +60,9 @@ runnables to offer this task. Its command must pass `"$ZED_FILE"` and
 the CLI expects a one-based line. Click the gutter arrow, or run **HTTP: run request
 at cursor** from the task picker, to explicitly launch it. The task calls `zed-http`
 from `PATH`; the integrated terminal displays the final URL, status, duration, size,
-headers, and formatted body.
+headers, and formatted body. Every captured response body is also saved under
+`<project-root>/.zed/http-client/`; the final terminal line gives its absolute path
+so it can be opened in Zed.
 
 ### Missing CLI diagnostic
 

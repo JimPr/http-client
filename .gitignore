@@ -3,3 +3,4 @@
 /grammars/
 http-client.environments.private.json
 http-client.environments.json
+/.zed/http-client/
