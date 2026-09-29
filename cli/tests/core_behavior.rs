@@ -1,14 +1,9 @@
-use std::{
-    collections::BTreeMap,
-    fs,
-    io::Cursor,
-    time::Duration,
-};
+use std::{collections::BTreeMap, fs, io::Cursor, time::Duration};
 
 use zed_http_runner::{
-    execute, load_environment, merge_variable_sources, parse_document, render_response,
-    resolve_request, select_environment, select_request, EnvironmentOptions, HttpMethod,
-    ResponseData, Selection,
+    EnvironmentOptions, HttpMethod, ResponseData, Selection, execute, load_environment,
+    merge_variable_sources, parse_document, render_response, resolve_request, save_response_body,
+    select_environment, select_request,
 };
 
 fn temporary_directory(label: &str) -> std::path::PathBuf {
@@ -53,7 +48,10 @@ GET https://api.example.test/health
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[0].name.as_deref(), Some("create-widget"));
     assert_eq!(requests[0].method, HttpMethod::Post);
-    assert_eq!(requests[0].headers[0], ("Authorization".into(), "Bearer {{token}}".into()));
+    assert_eq!(
+        requests[0].headers[0],
+        ("Authorization".into(), "Bearer {{token}}".into())
+    );
     assert_eq!(requests[0].body.as_deref(), Some(r#"{"name":"widget"}"#));
     assert_eq!(requests[1].start_line, 10);
 }
@@ -129,7 +127,11 @@ fn rejects_invalid_inline_declarations_without_echoing_values() {
     let error = parse_document("@api_key value-that-must-not-appear\nGET https://example.test/")
         .expect_err("invalid declaration rejects");
 
-    assert!(error.to_string().contains("invalid inline variable declaration"));
+    assert!(
+        error
+            .to_string()
+            .contains("invalid inline variable declaration")
+    );
     assert!(!error.to_string().contains("value-that-must-not-appear"));
 }
 
@@ -164,11 +166,10 @@ fn selects_a_request_by_name_index_or_containing_line() {
 
 #[test]
 fn resolves_variables_from_explicit_values_before_environment() {
-    let request = parse_document(
-        "POST https://{{host}}/items/{{item}}\nX-Token: {{token}}\n\n{{payload}}",
-    )
-    .expect("document parses")
-    .remove(0);
+    let request =
+        parse_document("POST https://{{host}}/items/{{item}}\nX-Token: {{token}}\n\n{{payload}}")
+            .expect("document parses")
+            .remove(0);
     let variables = BTreeMap::from([
         ("host".into(), "example.test".into()),
         ("item".into(), "42".into()),
@@ -185,7 +186,9 @@ fn resolves_variables_from_explicit_values_before_environment() {
 
 #[test]
 fn rejects_missing_variables_and_invalid_request_lines_explicitly() {
-    let request = parse_document("GET https://{{missing}}/").expect("document parses").remove(0);
+    let request = parse_document("GET https://{{missing}}/")
+        .expect("document parses")
+        .remove(0);
     let error = resolve_request(&request, &BTreeMap::new()).expect_err("must fail");
     assert!(error.to_string().contains("missing"));
 
@@ -214,6 +217,70 @@ fn renders_metadata_pretty_json_and_truncation_without_binary_body() {
 }
 
 #[test]
+fn saves_the_exact_binary_response_body_with_a_safe_content_type_extension() {
+    let directory = temporary_directory("saved-body");
+    let request_path = directory.join("request.http");
+    fs::write(&request_path, "GET http://example.test/download").expect("request writes");
+    let request = parse_document("# @name ../../evil\nGET http://example.test/download")
+        .expect("request parses")
+        .remove(0);
+    let response = ResponseData {
+        final_url: "http://example.test/download".into(),
+        status: 500,
+        duration_ms: 1,
+        headers: vec![(
+            "Content-Type".into(),
+            "Application/Vnd.Example+Json ; charset=UTF-8".into(),
+        )],
+        body: vec![0, 255, 42],
+        truncated: false,
+    };
+
+    let saved = save_response_body(&response, &request, &request_path, Some(&directory))
+        .expect("response saves");
+
+    assert_eq!(
+        fs::read(&saved.path).expect("saved body reads"),
+        [0, 255, 42]
+    );
+    assert_eq!(
+        saved.path.extension().and_then(|value| value.to_str()),
+        Some("json")
+    );
+    assert!(saved.path.starts_with(directory.join(".zed/http-client")));
+    assert!(
+        !saved
+            .path
+            .file_name()
+            .expect("file name")
+            .to_string_lossy()
+            .contains("..")
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        assert_eq!(
+            fs::metadata(&saved.path)
+                .expect("file metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(directory.join(".zed/http-client"))
+                .expect("directory metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+    }
+    fs::remove_dir_all(directory).expect("directory removes");
+}
+
+#[test]
 fn loads_public_and_private_values_for_an_explicit_environment() {
     let directory = temporary_directory("public-private");
     fs::write(
@@ -237,7 +304,10 @@ fn loads_public_and_private_values_for_an_explicit_environment() {
     .expect("environment loads");
 
     assert_eq!(values.get("HOST").map(String::as_str), Some("public.test"));
-    assert_eq!(values.get("TOKEN").map(String::as_str), Some("private-token"));
+    assert_eq!(
+        values.get("TOKEN").map(String::as_str),
+        Some("private-token")
+    );
     fs::remove_dir_all(directory).expect("directory removes");
 }
 
@@ -250,13 +320,17 @@ fn rejects_default_environment_as_an_unknown_v2_field() {
         r#"{"version":2,"defaultEnvironment":"staging","environments":[{"name":"staging","variables":{"HOST":"staging"}},{"name":"local","variables":{"HOST":"local"}}]}"#,
     )
     .expect("config writes");
-    let error = select_environment(&EnvironmentOptions {
-        request_path: directory.join("request.http"),
-        environment: None,
-        project_root: None,
-        config: Some(config),
-        private_config: None,
-    }, &mut Cursor::new(b"\n"), &mut Vec::new())
+    let error = select_environment(
+        &EnvironmentOptions {
+            request_path: directory.join("request.http"),
+            environment: None,
+            project_root: None,
+            config: Some(config),
+            private_config: None,
+        },
+        &mut Cursor::new(b"\n"),
+        &mut Vec::new(),
+    )
     .expect_err("v2 does not support persistent defaults");
     assert!(error.to_string().contains("invalid"));
     fs::remove_dir_all(directory).expect("directory removes");
@@ -283,18 +357,17 @@ fn selects_an_environment_from_injected_terminal_input() {
     let default = select_environment(&options, &mut Cursor::new(b"\n"), &mut rendered)
         .expect("empty input picks default");
     assert_eq!(default.name.as_deref(), Some("zebra"));
-    assert_eq!(default.values.get("HOST").map(String::as_str), Some("zebra.test"));
+    assert_eq!(
+        default.values.get("HOST").map(String::as_str),
+        Some("zebra.test")
+    );
     assert_eq!(
         String::from_utf8(rendered).expect("output utf8"),
         "Select environment:\n  1. zebra (preselected)\n  2. alpha\nEnter a number [1]: "
     );
 
-    let selected = select_environment(
-        &options,
-        &mut Cursor::new(b"2\n"),
-        &mut Vec::new(),
-    )
-    .expect("numeric selection succeeds");
+    let selected = select_environment(&options, &mut Cursor::new(b"2\n"), &mut Vec::new())
+        .expect("numeric selection succeeds");
     assert_eq!(selected.name.as_deref(), Some("alpha"));
 
     for input in [b"0\n".as_slice(), b"invalid\n".as_slice(), b"".as_slice()] {
@@ -322,17 +395,27 @@ fn public_configuration_controls_names_order_while_private_overrides_values() {
     .expect("private config writes");
 
     let mut output = Vec::new();
-    let values = select_environment(&EnvironmentOptions {
-        request_path: directory.join("request.http"),
-        environment: None,
-        project_root: None,
-        config: Some(public),
-        private_config: Some(private),
-    }, &mut Cursor::new(b"\n"), &mut output)
+    let values = select_environment(
+        &EnvironmentOptions {
+            request_path: directory.join("request.http"),
+            environment: None,
+            project_root: None,
+            config: Some(public),
+            private_config: Some(private),
+        },
+        &mut Cursor::new(b"\n"),
+        &mut output,
+    )
     .expect("picker chooses the first public environment");
 
-    assert_eq!(values.values.get("HOST").map(String::as_str), Some("public-zebra"));
-    assert_eq!(values.values.get("TOKEN").map(String::as_str), Some("private-token"));
+    assert_eq!(
+        values.values.get("HOST").map(String::as_str),
+        Some("public-zebra")
+    );
+    assert_eq!(
+        values.values.get("TOKEN").map(String::as_str),
+        Some("private-token")
+    );
     fs::remove_dir_all(directory).expect("directory removes");
 }
 
@@ -373,7 +456,11 @@ fn first_environment_is_only_the_picker_enter_preselection() {
     )
     .expect("enter chooses first picker item");
     assert_eq!(selected.name.as_deref(), Some("first"));
-    assert!(String::from_utf8(output).expect("utf8").contains("1. first (preselected)"));
+    assert!(
+        String::from_utf8(output)
+            .expect("utf8")
+            .contains("1. first (preselected)")
+    );
     fs::remove_dir_all(directory).expect("directory removes");
 }
 
@@ -394,10 +481,17 @@ fn rejects_unknown_names_invalid_models_and_unknown_versions_without_values() {
         private_config: None,
     })
     .expect_err("unknown environment rejects");
-    assert!(unknown.to_string().contains("unknown environment `missing`"));
+    assert!(
+        unknown
+            .to_string()
+            .contains("unknown environment `missing`")
+    );
 
-    fs::write(&config, r#"{"version":1,"environments":{"local":{"TOKEN":"do-not-display"}}}"#)
-        .expect("config writes");
+    fs::write(
+        &config,
+        r#"{"version":1,"environments":{"local":{"TOKEN":"do-not-display"}}}"#,
+    )
+    .expect("config writes");
     let legacy = load_environment(&EnvironmentOptions {
         request_path: directory.join("request.http"),
         environment: Some("local".into()),
@@ -409,8 +503,11 @@ fn rejects_unknown_names_invalid_models_and_unknown_versions_without_values() {
     assert!(legacy.to_string().contains("migrate to version 2"));
     assert!(!legacy.to_string().contains("do-not-display"));
 
-    fs::write(&config, r#"{"version":2,"environments":[{"name":"local","variables":{"TOKEN":3}}]}"#)
-        .expect("config writes");
+    fs::write(
+        &config,
+        r#"{"version":2,"environments":[{"name":"local","variables":{"TOKEN":3}}]}"#,
+    )
+    .expect("config writes");
     let invalid = load_environment(&EnvironmentOptions {
         request_path: directory.join("request.http"),
         environment: Some("local".into()),
@@ -528,10 +625,22 @@ fn gives_explicit_variables_precedence_over_inline_private_and_public_configurat
     );
 
     assert_eq!(variables.get("HOST").map(String::as_str), Some("explicit"));
-    assert_eq!(variables.get("PUBLIC_ONLY").map(String::as_str), Some("public"));
-    assert_eq!(variables.get("PRIVATE_ONLY").map(String::as_str), Some("private"));
-    assert_eq!(variables.get("INLINE_ONLY").map(String::as_str), Some("inline"));
-    assert_eq!(variables.get("EXPLICIT_ONLY").map(String::as_str), Some("explicit"));
+    assert_eq!(
+        variables.get("PUBLIC_ONLY").map(String::as_str),
+        Some("public")
+    );
+    assert_eq!(
+        variables.get("PRIVATE_ONLY").map(String::as_str),
+        Some("private")
+    );
+    assert_eq!(
+        variables.get("INLINE_ONLY").map(String::as_str),
+        Some("inline")
+    );
+    assert_eq!(
+        variables.get("EXPLICIT_ONLY").map(String::as_str),
+        Some("explicit")
+    );
 }
 
 #[test]

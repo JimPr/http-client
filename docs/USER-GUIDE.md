@@ -61,7 +61,10 @@ Accept: application/json
 
 Place the cursor on the `GET` line and click the gutter arrow. Select
 **HTTP: run request at cursor**. The integrated terminal shows the URL, status,
-headers, and response body.
+headers, and response body. It also saves the exact captured response bytes under
+`<project-root>/.zed/http-client/`. The final terminal line names the absolute
+path, size, and whether the response was truncated; copy or open that path in Zed.
+This includes empty, binary, and HTTP error (4xx/5xx) response bodies.
 
 You can also open
 [`examples/github-api.http`](../examples/github-api.http) from the cloned
@@ -129,7 +132,9 @@ Authorization: Bearer {{API_TOKEN}}
 ## Verification
 
 After a request finishes, the integrated terminal shows the selected environment,
-the final URL, the HTTP status, headers, and the response body.
+the final URL, the HTTP status, headers, and response body. Its **last line** is
+`Saved response body: /absolute/path (...)`. The generated body directory is
+Git-ignored while `.zed/tasks.json` remains versioned.
 
 ## Common problems
 
